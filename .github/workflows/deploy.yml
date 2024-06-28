@@ -35,5 +35,5 @@ jobs:
         uses: denoland/deployctl@v1
         with:
           project: "abdulrahman305-langgraphjs"
-          entrypoint: "src/index.ts "
+          entrypoint: "langgraph/src/index.ts "
           root: ""
