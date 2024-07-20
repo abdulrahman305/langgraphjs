@@ -6,11 +6,13 @@ export {
   StateGraph,
   type CompiledStateGraph,
   MessageGraph,
+  messagesStateReducer,
 } from "./graph/index.js";
 export { MemorySaver } from "./checkpoint/memory.js";
 export {
   type Checkpoint,
   type CheckpointMetadata,
+  type CheckpointTuple,
   copyCheckpoint,
   emptyCheckpoint,
   BaseCheckpointSaver,
@@ -21,3 +23,4 @@ export {
   InvalidUpdateError,
   EmptyChannelError,
 } from "./errors.js";
+export { type SerializerProtocol } from "./serde/base.js";

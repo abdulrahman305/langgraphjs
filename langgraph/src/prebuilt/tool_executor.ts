@@ -2,13 +2,14 @@ import {
   RunnableBinding,
   RunnableConfig,
   RunnableLambda,
+  RunnableToolLike,
 } from "@langchain/core/runnables";
-import { StructuredTool } from "@langchain/core/tools";
+import { StructuredToolInterface } from "@langchain/core/tools";
 
 const INVALID_TOOL_MSG_TEMPLATE = `{requestedToolName} is not a valid tool, try one of {availableToolNamesString}.`;
 
 export interface ToolExecutorArgs {
-  tools: Array<StructuredTool>;
+  tools: Array<StructuredToolInterface | RunnableToolLike>;
   /**
    * @default {INVALID_TOOL_MSG_TEMPLATE}
    */
@@ -35,9 +36,9 @@ export class ToolExecutor extends RunnableBinding<
 > {
   lc_graph_name = "ToolExecutor";
 
-  tools: Array<StructuredTool>;
+  tools: Array<StructuredToolInterface | RunnableToolLike>;
 
-  toolMap: Record<string, StructuredTool>;
+  toolMap: Record<string, StructuredToolInterface | RunnableToolLike>;
 
   invalidToolMsgTemplate: string;
 
@@ -59,13 +60,20 @@ export class ToolExecutor extends RunnableBinding<
     this.toolMap = this.tools.reduce((acc, tool) => {
       acc[tool.name] = tool;
       return acc;
-    }, {} as Record<string, StructuredTool>);
+    }, {} as Record<string, StructuredToolInterface | RunnableToolLike>);
   }
 
+  /**
+   * Execute a tool invocation
+   *
+   * @param {ToolInvocationInterface} toolInvocation The tool to invoke and the input to pass to it.
+   * @param {RunnableConfig | undefined} config Optional configuration to pass to the tool when invoked.
+   * @returns Either the result of the tool invocation (`string` or `ToolMessage`, set by the `ToolOutput` generic) or a string error message.
+   */
   async _execute(
     toolInvocation: ToolInvocationInterface,
     config?: RunnableConfig
-  ): Promise<string> {
+  ): Promise<ToolExecutorOutputType> {
     if (!(toolInvocation.tool in this.toolMap)) {
       return this.invalidToolMsgTemplate
         .replace("{requestedToolName}", toolInvocation.tool)
