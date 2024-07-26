@@ -36,6 +36,7 @@ These guides cover common examples of that.
 
 - [How to add human-in-the-loop](human-in-the-loop.ipynb)
 - [How to add breakpoints](breakpoints.ipynb)
+- [How to wait for user input](wait-user-input.ipynb)
 
 ## Streaming
 
@@ -45,6 +46,7 @@ These guides show how to use different streaming modes.
 - [How to stream full state of your graph](stream-values.ipynb)
 - [How to stream state updates of your graph](stream-updates.ipynb)
 - [How to stream LLM tokens](stream-tokens.ipynb)
+- [How to stream LLM tokens without LangChain models](streaming-tokens-without-langchain.ipynb)
 
 ## Other
 
