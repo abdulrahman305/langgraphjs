@@ -1,3 +1,4 @@
+/* eslint-disable no-promise-executor-return */
 import assert from "node:assert";
 import { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
 import {
@@ -18,6 +19,8 @@ export interface FakeChatModelArgs extends BaseChatModelParams {
 
 export class FakeChatModel extends BaseChatModel {
   responses: BaseMessage[];
+
+  callCount = 0;
 
   constructor(fields: FakeChatModelArgs) {
     super(fields);
@@ -47,8 +50,9 @@ export class FakeChatModel extends BaseChatModel {
         ],
       };
     }
-    const response = this.responses.shift();
+    const response = this.responses[this.callCount % this.responses.length];
     const text = messages.map((m) => m.content).join("\n");
+    this.callCount += 1;
     await runManager?.handleLLMNewToken(text);
     return {
       generations: [
@@ -96,6 +100,9 @@ export class FakeToolCallingChatModel extends BaseChatModel {
   ): Promise<ChatResult> {
     if (this.thrownErrorString) {
       throw new Error(this.thrownErrorString);
+    }
+    if (this.sleep !== undefined) {
+      await new Promise((resolve) => setTimeout(resolve, this.sleep));
     }
     const msg = this.responses?.[this.idx] ?? messages[this.idx];
     const generation: ChatResult = {
@@ -174,4 +181,13 @@ export class FakeSearchTool extends Tool {
   async _call(query: string): Promise<string> {
     return `result for ${query}`;
   }
+}
+
+// https://github.com/tc39/proposal-array-from-async
+export async function gatherIterator<T>(
+  i: AsyncIterable<T> | Promise<AsyncIterable<T>>
+): Promise<Array<T>> {
+  const out: T[] = [];
+  for await (const item of await i) out.push(item);
+  return out;
 }

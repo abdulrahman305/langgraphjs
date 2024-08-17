@@ -7,6 +7,10 @@ export {
   type CompiledStateGraph,
   MessageGraph,
   messagesStateReducer,
+  Annotation,
+  type StateType,
+  type UpdateType,
+  type CompiledGraph,
 } from "./graph/index.js";
 export { MemorySaver } from "./checkpoint/memory.js";
 export {
@@ -24,3 +28,4 @@ export {
   EmptyChannelError,
 } from "./errors.js";
 export { type SerializerProtocol } from "./serde/base.js";
+export { Send } from "./constants.js";

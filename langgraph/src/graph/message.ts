@@ -12,7 +12,7 @@ type Messages =
   | BaseMessageLike;
 
 export function messagesStateReducer(
-  left: Messages,
+  left: BaseMessage[],
   right: Messages
 ): BaseMessage[] {
   const leftArray = Array.isArray(left) ? left : [left];
@@ -59,7 +59,11 @@ export function messagesStateReducer(
   return merged.filter((m) => !idsToRemove.has(m.id));
 }
 
-export class MessageGraph extends StateGraph<BaseMessage[], Messages> {
+export class MessageGraph extends StateGraph<
+  BaseMessage[],
+  BaseMessage[],
+  Messages
+> {
   constructor() {
     super({
       channels: {

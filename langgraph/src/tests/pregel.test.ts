@@ -1,4 +1,5 @@
 /* eslint-disable no-process-env */
+/* eslint-disable no-promise-executor-return */
 import { it, expect, jest, beforeAll, describe } from "@jest/globals";
 import {
   RunnableConfig,
@@ -8,38 +9,50 @@ import {
 import { AgentAction, AgentFinish } from "@langchain/core/agents";
 import { PromptTemplate } from "@langchain/core/prompts";
 import { FakeStreamingLLM } from "@langchain/core/utils/testing";
-import { Tool } from "@langchain/core/tools";
+import { tool, Tool } from "@langchain/core/tools";
 import { z } from "zod";
 import {
   AIMessage,
   BaseMessage,
   FunctionMessage,
   HumanMessage,
+  ToolMessage,
 } from "@langchain/core/messages";
-import { FakeChatModel, MemorySaverAssertImmutable } from "./utils.js";
+import { ToolCall } from "@langchain/core/messages/tool";
+import {
+  gatherIterator,
+  FakeChatModel,
+  MemorySaverAssertImmutable,
+} from "./utils.js";
 import { LastValue } from "../channels/last_value.js";
-import { END, Graph, START, StateGraph } from "../graph/index.js";
+import {
+  Annotation,
+  END,
+  Graph,
+  START,
+  StateGraph,
+  StateType,
+} from "../graph/index.js";
 import { Topic } from "../channels/topic.js";
 import { PregelNode } from "../pregel/read.js";
 import { BaseChannel } from "../channels/base.js";
 import { MemorySaver } from "../checkpoint/memory.js";
 import { BinaryOperatorAggregate } from "../channels/binop.js";
+import { Channel, Pregel, PregelOptions } from "../pregel/index.js";
 import {
-  Channel,
-  Pregel,
-  PregelOptions,
   _applyWrites,
   _localRead,
   _prepareNextTasks,
   _shouldInterrupt,
-} from "../pregel/index.js";
+} from "../pregel/algo.js";
 import { ToolExecutor, createAgentExecutor } from "../prebuilt/index.js";
-import { MessageGraph } from "../graph/message.js";
+import { MessageGraph, messagesStateReducer } from "../graph/message.js";
 import { PASSTHROUGH } from "../pregel/write.js";
 import { Checkpoint } from "../checkpoint/base.js";
 import { GraphRecursionError, InvalidUpdateError } from "../errors.js";
 import { SqliteSaver } from "../checkpoint/sqlite.js";
 import { uuid6 } from "../checkpoint/id.js";
+import { Send, TASKS } from "../constants.js";
 
 // Tracing slows down the tests
 beforeAll(() => {
@@ -189,7 +202,7 @@ describe("Pregel", () => {
       // call method / assertions
       const expectedDefaults1 = [
         false, // debug
-        "values", // stream mode
+        ["values"], // stream mode
         "outputKey", // input keys
         ["inputKey", "outputKey", "channel3"], // output keys,
         {},
@@ -199,7 +212,7 @@ describe("Pregel", () => {
 
       const expectedDefaults2 = [
         true, // debug
-        "updates", // stream mode
+        ["updates"], // stream mode
         "inputKey", // input keys
         "outputKey", // output keys
         { tags: ["hello"] },
@@ -231,6 +244,7 @@ describe("_shouldInterrupt", () => {
           channel1: 1,
         },
       },
+      pending_sends: [],
     };
 
     const interruptNodes = ["node1"];
@@ -244,6 +258,7 @@ describe("_shouldInterrupt", () => {
           input: undefined,
           proc: new RunnablePassthrough(),
           writes: [],
+          triggers: [],
           config: undefined,
         },
       ])
@@ -263,6 +278,7 @@ describe("_shouldInterrupt", () => {
         channel1: 2, // current channel version is greater than last version seen
       },
       versions_seen: {},
+      pending_sends: [],
     };
 
     const interruptNodes = ["node1"];
@@ -276,6 +292,7 @@ describe("_shouldInterrupt", () => {
           input: undefined,
           proc: new RunnablePassthrough(),
           writes: [],
+          triggers: [],
           config: undefined,
         },
       ])
@@ -299,6 +316,7 @@ describe("_shouldInterrupt", () => {
           channel1: 2,
         },
       },
+      pending_sends: [],
     };
 
     const interruptNodes = ["node1"];
@@ -312,6 +330,7 @@ describe("_shouldInterrupt", () => {
           input: undefined,
           proc: new RunnablePassthrough(),
           writes: [],
+          triggers: [],
           config: undefined,
         },
       ])
@@ -335,6 +354,7 @@ describe("_shouldInterrupt", () => {
           channel1: 1,
         },
       },
+      pending_sends: [],
     };
 
     const interruptNodes = ["node1"];
@@ -348,6 +368,7 @@ describe("_shouldInterrupt", () => {
           input: undefined,
           proc: new RunnablePassthrough(),
           writes: [],
+          triggers: [],
           config: undefined,
         },
       ])
@@ -365,6 +386,7 @@ describe("_localRead", () => {
       channel_values: {},
       channel_versions: {},
       versions_seen: {},
+      pending_sends: [],
     };
 
     const channel1 = new LastValue<number>();
@@ -396,6 +418,7 @@ describe("_localRead", () => {
       channel_values: {},
       channel_versions: {},
       versions_seen: {},
+      pending_sends: [],
     };
 
     const channel1 = new LastValue<number>();
@@ -443,6 +466,7 @@ describe("_applyWrites", () => {
           channel1: 1,
         },
       },
+      pending_sends: [],
     };
 
     const lastValueChannel1 = new LastValue<string>();
@@ -488,6 +512,7 @@ describe("_applyWrites", () => {
           channel1: 1,
         },
       },
+      pending_sends: [],
     };
 
     const lastValueChannel1 = new LastValue<string>();
@@ -533,6 +558,7 @@ describe("_prepareNextTasks", () => {
           channel2: 5,
         },
       },
+      pending_sends: [],
     };
 
     const processes: Record<string, PregelNode> = {
@@ -562,7 +588,8 @@ describe("_prepareNextTasks", () => {
       checkpoint,
       processes,
       channels,
-      false
+      false,
+      { step: -1 }
     );
 
     expect(taskDescriptions.length).toBe(2);
@@ -607,6 +634,14 @@ describe("_prepareNextTasks", () => {
           channel6: 3,
         },
       },
+      pending_sends: [
+        {
+          node: "node1",
+          args: { test: true },
+        },
+        // Will not appear because node3 has no writers
+        { node: "node3", args: { test3: "value3" } },
+      ],
     };
 
     const processes: Record<string, PregelNode> = {
@@ -664,23 +699,70 @@ describe("_prepareNextTasks", () => {
       checkpoint,
       processes,
       channels,
-      true
+      true,
+      { step: -1 }
     );
 
-    expect(tasks.length).toBe(2);
+    expect(tasks.length).toBe(3);
     expect(tasks[0]).toEqual({
+      name: "node1",
+      input: { test: true },
+      proc: new RunnablePassthrough(),
+      writes: [],
+      triggers: [TASKS],
+      config: {
+        tags: [],
+        configurable: expect.any(Object),
+        metadata: {
+          langgraph_node: "node1",
+          langgraph_step: -1,
+          langgraph_task_idx: 0,
+          langgraph_triggers: [TASKS],
+        },
+        recursionLimit: 25,
+        runId: undefined,
+        runName: "node1",
+      },
+    });
+    expect(tasks[1]).toEqual({
       name: "node1",
       input: 1,
       proc: new RunnablePassthrough(),
       writes: [],
-      config: { tags: [] },
+      triggers: ["channel1"],
+      config: {
+        tags: [],
+        configurable: expect.any(Object),
+        metadata: {
+          langgraph_node: "node1",
+          langgraph_step: -1,
+          langgraph_task_idx: 1,
+          langgraph_triggers: ["channel1"],
+        },
+        recursionLimit: 25,
+        runId: undefined,
+        runName: "node1",
+      },
     });
-    expect(tasks[1]).toEqual({
+    expect(tasks[2]).toEqual({
       name: "node2",
       input: 100,
       proc: new RunnablePassthrough(),
       writes: [],
-      config: { tags: [] },
+      triggers: ["channel1", "channel2"],
+      config: {
+        tags: [],
+        configurable: expect.any(Object),
+        metadata: {
+          langgraph_node: "node2",
+          langgraph_step: -1,
+          langgraph_task_idx: 2,
+          langgraph_triggers: ["channel1", "channel2"],
+        },
+        recursionLimit: 25,
+        runId: undefined,
+        runName: "node2",
+      },
     });
 
     expect(newCheckpoint.versions_seen.node1.channel1).toBe(2);
@@ -877,48 +959,99 @@ it("should process two processes with object input and output", async () => {
       input: new LastValue<number>(),
       output: new LastValue<number>(),
     },
-    streamChannels: ["output", "inbox"],
     inputs: ["input", "inbox"],
+    streamChannels: ["output", "inbox"],
     outputs: "output",
   });
 
-  const streamResult = await app.stream(
-    { input: 2, inbox: 12 },
-    { outputKeys: "output" }
-  );
-  const outputResults = [];
-  for await (const result of streamResult) {
-    outputResults.push(result);
-  }
-  expect(outputResults).toEqual([13, 4]); // [12 + 1, 2 + 1 + 1]
+  expect(
+    await gatherIterator(
+      app.stream({ input: 2, inbox: 12 }, { outputKeys: "output" })
+    )
+  ).toEqual([13, 4]); // [12 + 1, 2 + 1 + 1]
 
-  const fullStreamResult = await app.stream({ input: 2, inbox: 12 });
-  const fullOutputResults = [];
-  for await (const result of fullStreamResult) {
-    fullOutputResults.push(result);
-  }
-  expect(fullOutputResults).toEqual([
+  expect(
+    await gatherIterator(
+      app.stream({ input: 2, inbox: 12 }, { streamMode: "updates" })
+    )
+  ).toEqual([
+    { one: { inbox: 3 } },
+    { two: { output: 13 } },
+    { two: { output: 4 } },
+  ]);
+
+  expect(await gatherIterator(app.stream({ input: 2, inbox: 12 }))).toEqual([
     { inbox: [3], output: 13 },
     { inbox: [], output: 4 },
   ]);
 
-  const fullOutputResultsUpdates = [];
-  for await (const result of await app.stream(
-    { input: 2, inbox: 12 },
-    { streamMode: "updates" }
-  )) {
-    fullOutputResultsUpdates.push(result);
-  }
-  expect(fullOutputResultsUpdates).toEqual([
+  const debug = await gatherIterator(
+    app.stream({ input: 2, inbox: 12 }, { streamMode: "debug" })
+  );
+  expect(debug).toEqual([
     {
-      one: {
-        inbox: 3,
-      },
-      two: {
-        output: 13,
+      type: "task",
+      timestamp: expect.any(String),
+      step: 0,
+      payload: {
+        id: "1726020d-12ca-56e2-a3d3-5b5752b526cf",
+        name: "one",
+        input: 2,
+        triggers: ["input"],
       },
     },
-    { two: { output: 4 } },
+    {
+      type: "task",
+      timestamp: expect.any(String),
+      step: 0,
+      payload: {
+        id: "ad0a1023-e379-52e7-be4c-5a2c1433aba0",
+        name: "two",
+        input: [12],
+        triggers: ["inbox"],
+      },
+    },
+    {
+      type: "task_result",
+      timestamp: expect.any(String),
+      step: 0,
+      payload: {
+        id: "1726020d-12ca-56e2-a3d3-5b5752b526cf",
+        name: "one",
+        result: [["inbox", 3]],
+      },
+    },
+    {
+      type: "task_result",
+      timestamp: expect.any(String),
+      step: 0,
+      payload: {
+        id: "ad0a1023-e379-52e7-be4c-5a2c1433aba0",
+        name: "two",
+        result: [["output", 13]],
+      },
+    },
+    {
+      type: "task",
+      timestamp: expect.any(String),
+      step: 1,
+      payload: {
+        id: "92ce7404-7c07-5383-b528-6933ac523e6a",
+        name: "two",
+        input: [3],
+        triggers: ["inbox"],
+      },
+    },
+    {
+      type: "task_result",
+      timestamp: expect.any(String),
+      step: 1,
+      payload: {
+        id: "92ce7404-7c07-5383-b528-6933ac523e6a",
+        name: "two",
+        result: [["output", 4]],
+      },
+    },
   ]);
 });
 
@@ -1068,6 +1201,29 @@ it("should process two inputs to two outputs validly", async () => {
 
   // An Inbox channel accumulates updates into a sequence
   expect(await app.invoke(2)).toEqual([3, 3]);
+});
+
+it("should allow a conditional edge after a send", async () => {
+  const State = {
+    items: Annotation<string[]>({
+      reducer: (a, b) => a.concat(b),
+    }),
+  };
+  const sendForFun = (state: StateType<typeof State>) => {
+    return [new Send("2", state), new Send("2", state)];
+  };
+  const routeToThree = () => "3";
+  const graph = new StateGraph(State)
+    .addNode("1", () => ({ items: ["1"] }))
+    .addNode("2", () => ({ items: ["2"] }))
+    .addNode("3", () => ({ items: ["3"] }))
+    .addEdge("__start__", "1")
+    .addConditionalEdges("1", sendForFun)
+    .addConditionalEdges("2", routeToThree)
+    .addEdge("3", "__end__")
+    .compile();
+  const res = await graph.invoke({ items: ["0"] });
+  expect(res).toEqual({ items: ["0", "1", "2", "2", "3"] });
 });
 
 it("should handle checkpoints correctly", async () => {
@@ -1774,6 +1930,497 @@ describe("StateGraph", () => {
       docs: ["doc1", "doc2", "doc3", "doc4"],
       answer: "doc1,doc2,doc3,doc4",
     });
+  });
+
+  it("Allow map reduce flows", async () => {
+    const OverallState = Annotation.Root({
+      subjects: Annotation<string[]>,
+      jokes: Annotation<string[]>({
+        reducer: (a, b) => a.concat(b),
+      }),
+    });
+    const continueToJokes = async (state: typeof OverallState.State) => {
+      return state.subjects.map((subject) => {
+        return new Send("generate_joke", { subjects: [subject] });
+      });
+    };
+    const graph = new StateGraph(OverallState)
+      .addNode("generate_joke", (state) => ({
+        jokes: [`Joke about ${state.subjects}`],
+      }))
+      .addConditionalEdges("__start__", continueToJokes)
+      .addEdge("generate_joke", "__end__")
+      .compile();
+    const res = await graph.invoke({ subjects: ["cats", "dogs"] });
+    // Invoking with two subjects results in a generated joke for each
+    expect(res).toEqual({
+      subjects: ["cats", "dogs"],
+      jokes: [`Joke about cats`, `Joke about dogs`],
+    });
+  });
+
+  it("State graph packets", async () => {
+    const AgentState = Annotation.Root({
+      messages: Annotation({
+        reducer: messagesStateReducer,
+      }),
+    });
+    const searchApi = tool(
+      async ({ query }) => {
+        return `result for ${query}`;
+      },
+      {
+        name: "search_api",
+        schema: z.object({
+          query: z.string(),
+        }),
+        description: "Searches the API for the query",
+      }
+    );
+
+    const toolsByName = { [searchApi.name]: searchApi };
+    const model = new FakeChatModel({
+      responses: [
+        new AIMessage({
+          id: "ai1",
+          content: "",
+          tool_calls: [
+            {
+              id: "tool_call123",
+              name: "search_api",
+              args: { query: "query" },
+              type: "tool_call",
+            },
+          ],
+        }),
+        new AIMessage({
+          id: "ai2",
+          content: "",
+          tool_calls: [
+            {
+              id: "tool_call234",
+              name: "search_api",
+              args: { query: "another", idx: 0 },
+              type: "tool_call",
+            },
+            {
+              id: "tool_call567",
+              name: "search_api",
+              args: { query: "a third one", idx: 1 },
+              type: "tool_call",
+            },
+          ],
+        }),
+        new AIMessage({
+          id: "ai3",
+          content: "answer",
+        }),
+      ],
+    });
+
+    const agent = async (state: typeof AgentState.State) => {
+      return {
+        messages: await model.invoke(state.messages),
+      };
+    };
+
+    const shouldContinue = async (state: typeof AgentState.State) => {
+      // TODO: Support this?
+      // expect(state.something_extra).toEqual("hi there");
+      const toolCalls = (state.messages[state.messages.length - 1] as AIMessage)
+        .tool_calls;
+      if (toolCalls?.length) {
+        return toolCalls.map((toolCall) => {
+          return new Send("tools", toolCall);
+        });
+      } else {
+        return "__end__";
+      }
+    };
+
+    const toolsNode = async (toolCall: ToolCall) => {
+      await new Promise((resolve) =>
+        setTimeout(resolve, toolCall.args.idx * 100)
+      );
+      const toolMessage = await toolsByName[toolCall.name].invoke(toolCall);
+      return {
+        messages: new ToolMessage({
+          content: toolMessage.content,
+          id: toolCall.args.idx !== undefined ? `${toolCall.args.idx}` : "abc",
+          tool_call_id: toolMessage.tool_call_id,
+          name: toolMessage.name,
+        }),
+      };
+    };
+
+    const builder = new StateGraph(AgentState)
+      .addNode("agent", agent)
+      .addNode("tools", toolsNode)
+      .addEdge("__start__", "agent")
+      .addConditionalEdges("agent", shouldContinue)
+      .addEdge("tools", "agent");
+    const inputMessage = new HumanMessage({
+      id: "foo",
+      content: "what is weather in sf",
+    });
+    const expectedOutputMessages = [
+      inputMessage,
+      new AIMessage({
+        id: "ai1",
+        content: "",
+        tool_calls: [
+          {
+            id: "tool_call123",
+            name: "search_api",
+            args: { query: "query" },
+            type: "tool_call",
+          },
+        ],
+      }),
+      new ToolMessage({
+        id: "abc",
+        content: "result for query",
+        name: "search_api",
+        tool_call_id: "tool_call123",
+      }),
+      new AIMessage({
+        id: "ai2",
+        content: "",
+        tool_calls: [
+          {
+            id: "tool_call234",
+            name: "search_api",
+            args: { query: "another", idx: 0 },
+            type: "tool_call",
+          },
+          {
+            id: "tool_call567",
+            name: "search_api",
+            args: { query: "a third one", idx: 1 },
+            type: "tool_call",
+          },
+        ],
+      }),
+      new ToolMessage({
+        id: "0",
+        content: "result for another",
+        name: "search_api",
+        tool_call_id: "tool_call234",
+      }),
+      new ToolMessage({
+        id: "1",
+        content: "result for a third one",
+        name: "search_api",
+        tool_call_id: "tool_call567",
+      }),
+      new AIMessage({
+        id: "ai3",
+        content: "answer",
+      }),
+    ];
+    const res = await builder.compile().invoke({
+      messages: [inputMessage],
+    });
+    expect(res).toEqual({
+      messages: expectedOutputMessages,
+    });
+
+    const stream = await builder.compile().stream({
+      messages: [inputMessage],
+    });
+    let chunks = [];
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+    const nodeOrder = ["agent", "tools", "agent", "tools", "tools", "agent"];
+    expect(nodeOrder.length).toEqual(chunks.length);
+    expect(chunks).toEqual(
+      // The input message is not streamed back
+      expectedOutputMessages.slice(1).map((message, i) => {
+        return {
+          [nodeOrder[i]]: { messages: message },
+        };
+      })
+    );
+
+    const appWithInterrupt = builder.compile({
+      checkpointer: new MemorySaverAssertImmutable(),
+      interruptAfter: ["agent"],
+    });
+    const config = { configurable: { thread_id: "1" } };
+    chunks = [];
+    for await (const chunk of await appWithInterrupt.stream(
+      {
+        messages: [inputMessage],
+      },
+      config
+    )) {
+      chunks.push(chunk);
+    }
+    expect(chunks).toEqual([
+      {
+        agent: {
+          messages: expectedOutputMessages[1],
+        },
+      },
+    ]);
+    const appWithInterruptState = await appWithInterrupt.getState(config);
+    expect(appWithInterruptState).toEqual({
+      values: {
+        messages: expectedOutputMessages.slice(0, 2),
+      },
+      next: ["tools"],
+      metadata: {
+        source: "loop",
+        step: 1,
+        writes: {
+          agent: {
+            messages: expectedOutputMessages[1],
+          },
+        },
+      },
+      config: (await appWithInterrupt.checkpointer?.getTuple(config))?.config,
+      createdAt: (await appWithInterrupt.checkpointer?.getTuple(config))
+        ?.checkpoint.ts,
+      // TODO: Populate, see Python test
+      parentConfig: undefined,
+    });
+
+    // modify ai message
+    const lastMessage =
+      appWithInterruptState!.values.messages[
+        appWithInterruptState!.values.messages.length - 1
+      ];
+    lastMessage.tool_calls[0].args.query = "a different query";
+    await appWithInterrupt.updateState(config, {
+      messages: lastMessage,
+      something_extra: "hi there",
+    });
+    expect(await appWithInterrupt.getState(config)).toEqual({
+      values: {
+        messages: [
+          expectedOutputMessages[0],
+          new AIMessage({
+            id: "ai1",
+            content: "",
+            tool_calls: [
+              {
+                id: "tool_call123",
+                name: "search_api",
+                args: { query: "a different query" },
+                type: "tool_call",
+              },
+            ],
+          }),
+        ],
+      },
+      next: ["tools"],
+      metadata: {
+        source: "update",
+        step: 2,
+        writes: {
+          agent: {
+            messages: new AIMessage({
+              id: "ai1",
+              content: "",
+              tool_calls: [
+                {
+                  id: "tool_call123",
+                  name: "search_api",
+                  args: { query: "a different query" },
+                  type: "tool_call",
+                },
+              ],
+            }),
+            something_extra: "hi there",
+          },
+        },
+      },
+      config: (await appWithInterrupt.checkpointer?.getTuple(config))?.config,
+      createdAt: (await appWithInterrupt.checkpointer?.getTuple(config))
+        ?.checkpoint.ts,
+      // TODO: Populate, see Python test
+      parentConfig: undefined,
+    });
+
+    chunks = [];
+    for await (const chunk of await appWithInterrupt.stream(null, config)) {
+      chunks.push(chunk);
+    }
+    expect(chunks).toEqual([
+      {
+        tools: {
+          messages: new ToolMessage({
+            id: "abc",
+            content: "result for a different query",
+            name: "search_api",
+            tool_call_id: "tool_call123",
+          }),
+        },
+      },
+      {
+        agent: {
+          messages: expectedOutputMessages[3],
+        },
+      },
+    ]);
+
+    expect(await appWithInterrupt.getState(config)).toEqual({
+      values: {
+        messages: [
+          expectedOutputMessages[0],
+          new AIMessage({
+            id: "ai1",
+            content: "",
+            tool_calls: [
+              {
+                id: "tool_call123",
+                name: "search_api",
+                args: { query: "a different query" },
+                type: "tool_call",
+              },
+            ],
+          }),
+          new ToolMessage({
+            id: "abc",
+            content: "result for a different query",
+            name: "search_api",
+            tool_call_id: "tool_call123",
+          }),
+          expectedOutputMessages[3],
+        ],
+      },
+      next: ["tools", "tools"],
+      metadata: {
+        source: "loop",
+        step: 4,
+        writes: {
+          agent: {
+            messages: expectedOutputMessages[3],
+          },
+        },
+      },
+      createdAt: (await appWithInterrupt.checkpointer?.getTuple(config))
+        ?.checkpoint.ts,
+      config: (await appWithInterrupt.checkpointer?.getTuple(config))?.config,
+      // TODO: Populate, see Python test
+      parentConfig: undefined,
+    });
+
+    // replaces message even if object identity is different, as long as id is the same
+    await appWithInterrupt.updateState(config, {
+      messages: new AIMessage({
+        id: "ai2",
+        content: "answer",
+      }),
+      something_extra: "hi there",
+    });
+
+    expect(await appWithInterrupt.getState(config)).toEqual({
+      values: {
+        messages: [
+          expectedOutputMessages[0],
+          new AIMessage({
+            id: "ai1",
+            content: "",
+            tool_calls: [
+              {
+                id: "tool_call123",
+                name: "search_api",
+                args: { query: "a different query" },
+                type: "tool_call",
+              },
+            ],
+          }),
+          new ToolMessage({
+            id: "abc",
+            content: "result for a different query",
+            name: "search_api",
+            tool_call_id: "tool_call123",
+          }),
+          new AIMessage({
+            content: "answer",
+            id: "ai2",
+          }),
+        ],
+      },
+      next: [],
+      metadata: {
+        source: "update",
+        step: 5,
+        writes: {
+          agent: {
+            messages: new AIMessage({
+              content: "answer",
+              id: "ai2",
+            }),
+            something_extra: "hi there",
+          },
+        },
+      },
+      createdAt: (await appWithInterrupt.checkpointer?.getTuple(config))
+        ?.checkpoint.ts,
+      config: (await appWithInterrupt.checkpointer?.getTuple(config))?.config,
+      // TODO: Populate, see Python test
+      parentConfig: undefined,
+    });
+  });
+
+  it("multiple stream mode", async () => {
+    const builder = new StateGraph({
+      value: Annotation<number>({ reducer: (a, b) => a + b }),
+    })
+      .addNode("add_one", () => ({ value: 1 }))
+      .addEdge(START, "add_one")
+      .addConditionalEdges("add_one", (state) => {
+        if (state.value < 6) return "add_one";
+        return END;
+      });
+
+    const graph = builder.compile();
+
+    expect(
+      await gatherIterator(
+        graph.stream({ value: 1 }, { streamMode: ["values"] })
+      )
+    ).toEqual([
+      { value: 1 },
+      { value: 2 },
+      { value: 3 },
+      { value: 4 },
+      { value: 5 },
+      { value: 6 },
+    ]);
+
+    expect(
+      await gatherIterator(
+        graph.stream({ value: 1 }, { streamMode: ["updates"] })
+      )
+    ).toEqual([
+      { add_one: { value: 1 } },
+      { add_one: { value: 1 } },
+      { add_one: { value: 1 } },
+      { add_one: { value: 1 } },
+      { add_one: { value: 1 } },
+    ]);
+
+    expect(
+      await gatherIterator(
+        graph.stream({ value: 1 }, { streamMode: ["values", "updates"] })
+      )
+    ).toEqual([
+      ["values", { value: 1 }],
+      ["updates", { add_one: { value: 1 } }],
+      ["values", { value: 2 }],
+      ["updates", { add_one: { value: 1 } }],
+      ["values", { value: 3 }],
+      ["updates", { add_one: { value: 1 } }],
+      ["values", { value: 4 }],
+      ["updates", { add_one: { value: 1 } }],
+      ["values", { value: 5 }],
+      ["updates", { add_one: { value: 1 } }],
+      ["values", { value: 6 }],
+    ]);
   });
 });
 

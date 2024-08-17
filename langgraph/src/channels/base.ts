@@ -8,6 +8,10 @@ export abstract class BaseChannel<
   UpdateType = unknown,
   CheckpointType = unknown
 > {
+  ValueType: ValueType;
+
+  UpdateType: UpdateType;
+
   /**
    * The name of the channel.
    */
@@ -90,5 +94,6 @@ export function createCheckpoint<ValueType>(
     channel_values: values,
     channel_versions: { ...checkpoint.channel_versions },
     versions_seen: deepCopy(checkpoint.versions_seen),
+    pending_sends: checkpoint.pending_sends ?? [],
   };
 }
