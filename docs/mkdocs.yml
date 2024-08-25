@@ -57,7 +57,8 @@ plugins:
       include_source: True
       include_requirejs: true
   - typedoc:
-      source: "../langgraph/*.d.ts"
+      # One level of globbing is intentional
+      source: "../libs/*/*.d.ts"
       output_dir: "./reference"
       tsconfig: "../tsconfig.json"
       options: "typedoc.json"
@@ -91,19 +92,32 @@ nav:
           - Install and manage dependencies: "how-tos/manage-ecosystem-dependencies.ipynb"
           - Use LangGraph.js in web environments: "how-tos/use-in-web-environments.ipynb"
       - Controllability:
+          - Define graph state: "how-tos/define-state.ipynb"
           - Create subgraphs: "how-tos/subgraph.ipynb"
           - Create branches for parallel execution: "how-tos/branching.ipynb"
+          - Create map-reduce branches for parallel execution: "how-tos/map-reduce.ipynb"
       - Persistence:
           - Add persistence ("memory") to your graph: "how-tos/persistence.ipynb"
           - View and update past graph state: "how-tos/time-travel.ipynb"
+          - Manage conversation history: how-tos/manage-conversation-history.ipynb
           - Create a custom checkpointer using Postgres: "how-tos/persistence-postgres.ipynb"
+          - How to delete messages: "how-tos/delete-messages.ipynb"
       - Human-in-the-loop:
           - Add human-in-the-loop: "how-tos/human-in-the-loop.ipynb"
+          - Add breakpoints: how-tos/breakpoints.ipynb
+          - Wait for user input: how-tos/wait-user-input.ipynb
+          - View and update past graph state: how-tos/time-travel.ipynb
+          - Edit graph state: how-tos/edit-graph-state.ipynb
       - Streaming:
           - Stream full state: "how-tos/stream-values.ipynb"
           - Stream state updates: "how-tos/stream-updates.ipynb"
           - Stream LLM tokens: "how-tos/stream-tokens.ipynb"
           - Stream LLM tokens without LangChain models: "how-tos/streaming-tokens-without-langchain.ipynb"
+      - Tool calling:
+          - Call tools using ToolNode: how-tos/tool-calling.ipynb
+          - Handle tool calling errors: how-tos/tool-calling-errors.ipynb
+          - Force an agent to call a tool: how-tos/force-calling-a-tool-first.ipynb
+          # - Pass graph state to tools: how-tos/pass-run-time-values-to-tools.ipynb TODO
       - Other:
           - Add runtime configuration: "how-tos/configuration.ipynb"
           - Force an agent to call a tool: "how-tos/force-calling-a-tool-first.ipynb"
@@ -113,6 +127,10 @@ nav:
           - Manage agent steps: "how-tos/managing-agent-steps.ipynb"
   - "Conceptual Guides":
       - "concepts/index.md"
+      - LangGraph for Agentic Applications: concepts/high_level.md
+      - Low Level LangGraph Concepts: concepts/low_level.md
+      - Common Agentic Patterns: concepts/agentic_concepts.md
+      - FAQ: concepts/faq.md
   - "Reference":
       - "reference/index.html"
 
