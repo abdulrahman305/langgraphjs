@@ -32,6 +32,7 @@ import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
 import {
   createAnyStringSame,
   FakeChatModel,
+  FakeTracer,
   MemorySaverAssertImmutable,
 } from "./utils.js";
 import { gatherIterator } from "../utils.js";
@@ -42,6 +43,7 @@ import {
   Graph,
   START,
   StateGraph,
+  StateGraphArgs,
   StateType,
 } from "../graph/index.js";
 import { Topic } from "../channels/topic.js";
@@ -59,7 +61,11 @@ import {
 import { ToolExecutor, createAgentExecutor } from "../prebuilt/index.js";
 import { MessageGraph, messagesStateReducer } from "../graph/message.js";
 import { PASSTHROUGH } from "../pregel/write.js";
-import { GraphRecursionError, InvalidUpdateError } from "../errors.js";
+import {
+  GraphRecursionError,
+  InvalidUpdateError,
+  NodeInterrupt,
+} from "../errors.js";
 import { ERROR, INTERRUPT, Send, TASKS } from "../constants.js";
 
 describe("Channel", () => {
@@ -702,10 +708,12 @@ describe("_prepareNextTasks", () => {
     expect(taskDescriptions[0]).toEqual({
       id: expect.any(String),
       name: "node1",
+      interrupts: [],
     });
     expect(taskDescriptions[1]).toEqual({
       id: expect.any(String),
       name: "node2",
+      interrupts: [],
     });
 
     // the returned checkpoint is a copy of the passed checkpoint without versionsSeen updated
@@ -1133,6 +1141,7 @@ it("should process two processes with object input and output", async () => {
         name: "one",
         input: 2,
         triggers: ["input"],
+        interrupts: [],
       },
     },
     {
@@ -1144,6 +1153,7 @@ it("should process two processes with object input and output", async () => {
         name: "two",
         input: [12],
         triggers: ["inbox"],
+        interrupts: [],
       },
     },
     {
@@ -1175,6 +1185,7 @@ it("should process two processes with object input and output", async () => {
         name: "two",
         input: [3],
         triggers: ["inbox"],
+        interrupts: [],
       },
     },
     {
@@ -1325,13 +1336,13 @@ it("should invoke two processes with input/output and interrupt", async () => {
           checkpoint_id: expect.any(String),
         },
       },
-      metadata: { source: "loop", step: 6, writes: 5 },
+      metadata: { source: "loop", step: 6, writes: { two: 5 } },
       createdAt: expect.any(String),
       parentConfig: history[1].config,
     }),
     expect.objectContaining({
       values: { inbox: 4, output: 4, input: 3 },
-      tasks: [{ id: expect.any(String), name: "two" }],
+      tasks: [{ id: expect.any(String), name: "two", interrupts: [] }],
       next: ["two"],
       config: {
         configurable: {
@@ -1340,13 +1351,13 @@ it("should invoke two processes with input/output and interrupt", async () => {
           checkpoint_id: expect.any(String),
         },
       },
-      metadata: { source: "loop", step: 5 },
+      metadata: { source: "loop", step: 5, writes: {} },
       createdAt: expect.any(String),
       parentConfig: history[2].config,
     }),
     expect.objectContaining({
       values: { inbox: 21, output: 4, input: 3 },
-      tasks: [{ id: expect.any(String), name: "one" }],
+      tasks: [{ id: expect.any(String), name: "one", interrupts: [] }],
       next: ["one"],
       config: {
         configurable: {
@@ -1361,7 +1372,7 @@ it("should invoke two processes with input/output and interrupt", async () => {
     }),
     expect.objectContaining({
       values: { inbox: 21, output: 4, input: 20 },
-      tasks: [{ id: expect.any(String), name: "two" }],
+      tasks: [{ id: expect.any(String), name: "two", interrupts: [] }],
       next: ["two"],
       config: {
         configurable: {
@@ -1370,13 +1381,13 @@ it("should invoke two processes with input/output and interrupt", async () => {
           checkpoint_id: expect.any(String),
         },
       },
-      metadata: { source: "loop", step: 3 },
+      metadata: { source: "loop", step: 3, writes: {} },
       createdAt: expect.any(String),
       parentConfig: history[4].config,
     }),
     expect.objectContaining({
       values: { inbox: 3, output: 4, input: 20 },
-      tasks: [{ id: expect.any(String), name: "one" }],
+      tasks: [{ id: expect.any(String), name: "one", interrupts: [] }],
       next: ["one"],
       config: {
         configurable: {
@@ -1400,13 +1411,13 @@ it("should invoke two processes with input/output and interrupt", async () => {
           checkpoint_id: expect.any(String),
         },
       },
-      metadata: { source: "loop", step: 1, writes: 4 },
+      metadata: { source: "loop", step: 1, writes: { two: 4 } },
       createdAt: expect.any(String),
       parentConfig: history[6].config,
     }),
     expect.objectContaining({
       values: { inbox: 3, input: 2 },
-      tasks: [{ id: expect.any(String), name: "two" }],
+      tasks: [{ id: expect.any(String), name: "two", interrupts: [] }],
       next: ["two"],
       config: {
         configurable: {
@@ -1415,13 +1426,13 @@ it("should invoke two processes with input/output and interrupt", async () => {
           checkpoint_id: expect.any(String),
         },
       },
-      metadata: { source: "loop", step: 0 },
+      metadata: { source: "loop", step: 0, writes: {} },
       createdAt: expect.any(String),
       parentConfig: history[7].config,
     }),
     expect.objectContaining({
       values: { input: 2 },
-      tasks: [{ id: expect.any(String), name: "one" }],
+      tasks: [{ id: expect.any(String), name: "one", interrupts: [] }],
       next: ["one"],
       config: {
         configurable: {
@@ -1648,16 +1659,17 @@ it("pending writes resume", async () => {
   expect(state.values).toEqual({ value: 1 });
   expect(state.next).toEqual(["one", "two"]);
   expect(state.tasks).toEqual([
-    { id: expect.any(String), name: "one" },
+    { id: expect.any(String), name: "one", interrupts: [] },
     {
       id: expect.any(String),
       name: "two",
       error: expect.objectContaining({
         message: "I'm not good",
       }),
+      interrupts: [],
     },
   ]);
-  expect(state.metadata).toEqual({ source: "loop", step: 0 });
+  expect(state.metadata).toEqual({ source: "loop", step: 0, writes: null });
 
   // should contain pending write of "one" and should contain error from "two"
   const checkpoint = await checkpointer.getTuple(thread1);
@@ -2035,9 +2047,9 @@ describe("StateGraph", () => {
     data: typeof AgentAnnotation.State
   ): Promise<string> => {
     if (data.agentOutcome && "returnValues" in data.agentOutcome) {
-      return "exit";
+      return "__end__";
     }
-    return "continue";
+    return "tools";
   };
 
   it("can invoke", async () => {
@@ -2087,10 +2099,7 @@ describe("StateGraph", () => {
       .addNode("tools", executeTools)
       .addEdge(START, "agent")
       .addEdge("agent", "passthrough")
-      .addConditionalEdges("passthrough", shouldContinue, {
-        continue: "tools",
-        exit: END,
-      })
+      .addConditionalEdges("passthrough", shouldContinue, ["tools", "__end__"])
       .addEdge("tools", "agent")
       .compile();
 
@@ -2107,7 +2116,7 @@ describe("StateGraph", () => {
         ],
       }
     );
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 200));
     expect(result).toEqual({
       input: "what is the weather in sf?",
       agentOutcome: {
@@ -2181,10 +2190,7 @@ describe("StateGraph", () => {
       .addNode("agent", agent)
       .addNode("tools", executeTools)
       .addEdge(START, "agent")
-      .addConditionalEdges("agent", shouldContinue, {
-        continue: "tools",
-        exit: END,
-      })
+      .addConditionalEdges("agent", shouldContinue, ["tools", "__end__"])
       .addEdge("tools", "agent")
       .compile();
 
@@ -2429,6 +2435,165 @@ describe("StateGraph", () => {
     });
   });
 
+  it("should handle dynamic interrupt", async () => {
+    const checkpointer = new MemorySaverAssertImmutable();
+
+    let toolTwoNodeCount = 0;
+
+    const StateAnnotation = Annotation.Root({
+      my_key: Annotation<string>({ reducer: (a, b) => a + b }),
+      market: Annotation<string>(),
+    });
+
+    const toolTwoNode = (
+      s: typeof StateAnnotation.State
+    ): Partial<typeof StateAnnotation.State> => {
+      toolTwoNodeCount += 1;
+      if (s.market === "DE") {
+        throw new NodeInterrupt("Just because...");
+      }
+      return { my_key: " all good" };
+    };
+
+    const toolTwoGraph = new StateGraph(StateAnnotation)
+      .addNode("tool_two", toolTwoNode, { retryPolicy: {} })
+      .addEdge(START, "tool_two");
+    let toolTwo = toolTwoGraph.compile();
+
+    const tracer = new FakeTracer();
+    const result = await toolTwo.invoke(
+      { my_key: "value", market: "DE" },
+      { callbacks: [tracer] }
+    );
+    expect(result).toEqual({
+      my_key: "value",
+      market: "DE",
+    });
+    expect(toolTwoNodeCount).toBe(1); // interrupts aren't retried
+    expect(tracer.runs.length).toBe(1);
+    const run = tracer.runs[0];
+    expect(run.end_time).toBeDefined();
+    expect(run.error).toBeUndefined();
+    expect(run.outputs).toEqual({ market: "DE", my_key: "value" });
+
+    expect(await toolTwo.invoke({ my_key: "value", market: "US" })).toEqual({
+      my_key: "value all good",
+      market: "US",
+    });
+
+    toolTwo = toolTwoGraph.compile({ checkpointer });
+
+    // missing thread_id
+    await expect(
+      toolTwo.invoke({ my_key: "value", market: "DE" })
+    ).rejects.toThrow(/thread_id/);
+
+    const thread1 = { configurable: { thread_id: "1" } };
+    // stop when about to enter node
+    expect(
+      await toolTwo.invoke({ my_key: "value ⛰️", market: "DE" }, thread1)
+    ).toEqual({
+      my_key: "value ⛰️",
+      market: "DE",
+    });
+
+    const checkpoints = await gatherIterator(
+      toolTwo.checkpointer!.list(thread1)
+    );
+    expect(checkpoints.map((c) => c.metadata)).toEqual([
+      {
+        source: "loop",
+        step: 0,
+        writes: null,
+      },
+      {
+        source: "input",
+        step: -1,
+        writes: { my_key: "value ⛰️", market: "DE" },
+      },
+    ]);
+
+    const state = await toolTwo.getState(thread1);
+    expect(state).toEqual({
+      values: { my_key: "value ⛰️", market: "DE" },
+      next: ["tool_two"],
+      tasks: [
+        {
+          id: expect.any(String),
+          name: "tool_two",
+          interrupts: [
+            {
+              value: "Just because...",
+              when: "during",
+            },
+          ],
+        },
+      ],
+      config: (await toolTwo.checkpointer!.getTuple(thread1))!.config,
+      createdAt: (await toolTwo.checkpointer!.getTuple(thread1))!.checkpoint.ts,
+      metadata: { source: "loop", step: 0, writes: null },
+      parentConfig: (
+        await gatherIterator(toolTwo.checkpointer!.list(thread1, { limit: 2 }))
+      ).slice(-1)[0].config,
+    });
+  });
+
+  it("should not cancel node on other node interrupted", async () => {
+    const checkpointer = new MemorySaverAssertImmutable();
+
+    const StateAnnotation = Annotation.Root({
+      hello: Annotation<string>,
+    });
+
+    let awhiles = 0;
+    let awhileReturns = 0;
+
+    const awhile = async (
+      _: typeof StateAnnotation.State
+    ): Promise<Partial<typeof StateAnnotation.State>> => {
+      awhiles += 1;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      awhileReturns += 1;
+      return { hello: "again" };
+    };
+
+    const iambad = async (input: typeof StateAnnotation.State) => {
+      if (input.hello !== "bye") {
+        throw new NodeInterrupt("I am bad");
+      }
+      return {};
+    };
+
+    const builder = new StateGraph(StateAnnotation)
+      .addNode("agent", awhile)
+      .addNode("bad", iambad)
+      .addConditionalEdges(START, () => ["agent", "bad"]);
+
+    const graph = builder.compile({ checkpointer });
+    const thread = { configurable: { thread_id: "1" } };
+
+    // Return state at interrupt time
+    expect(await graph.invoke({ hello: "world" }, thread)).toEqual({
+      hello: "world",
+    });
+
+    expect(awhileReturns).toBe(1);
+    expect(awhiles).toBe(1);
+
+    // No more tasks, so no return value
+    expect(await graph.invoke(null, thread)).toBeUndefined();
+
+    expect(awhileReturns).toBe(1);
+    expect(awhiles).toBe(1);
+
+    expect(await graph.invoke({ hello: "bye" }, thread)).toEqual({
+      hello: "again",
+    });
+
+    expect(awhileReturns).toBe(2);
+    expect(awhiles).toBe(2);
+  });
+
   it("Allow map reduce flows", async () => {
     const OverallState = Annotation.Root({
       subjects: Annotation<string[]>,
@@ -2662,7 +2827,7 @@ describe("StateGraph", () => {
       values: {
         messages: expectedOutputMessages.slice(0, 2),
       },
-      tasks: [{ id: expect.any(String), name: "tools" }],
+      tasks: [{ id: expect.any(String), name: "tools", interrupts: [] }],
       next: ["tools"],
       metadata: {
         source: "loop",
@@ -2712,7 +2877,7 @@ describe("StateGraph", () => {
         ],
       },
       next: ["tools"],
-      tasks: [{ id: expect.any(String), name: "tools" }],
+      tasks: [{ id: expect.any(String), name: "tools", interrupts: [] }],
       metadata: {
         source: "update",
         step: 2,
@@ -2790,8 +2955,8 @@ describe("StateGraph", () => {
       },
       next: ["tools", "tools"],
       tasks: [
-        { id: expect.any(String), name: "tools" },
-        { id: expect.any(String), name: "tools" },
+        { id: expect.any(String), name: "tools", interrupts: [] },
+        { id: expect.any(String), name: "tools", interrupts: [] },
       ],
       metadata: {
         source: "loop",
@@ -2930,6 +3095,475 @@ describe("StateGraph", () => {
       ["updates", { add_one: { value: 1 } }],
       ["values", { value: 6 }],
     ]);
+  });
+
+  it("should handle node schemas with custom output", async () => {
+    const StateAnnotation = Annotation.Root({
+      hello: Annotation<string>,
+      bye: Annotation<string>,
+      messages: Annotation<string[]>({
+        reducer: (a: string[], b: string[]) => [...a, ...b],
+        default: () => [],
+      }),
+    });
+
+    const OutputAnnotation = Annotation.Root({
+      messages: Annotation<string[]>,
+    });
+
+    const nodeA = (state: { hello: string; messages: string[] }) => {
+      // Unfortunately can't infer input types at runtime :(
+      expect(state).toEqual({
+        bye: "world",
+        hello: "there",
+        messages: ["hello"],
+      });
+      return {};
+    };
+
+    const nodeB = (state: { bye: string; now: number }) => {
+      // Unfortunately can't infer input types at runtime :(
+      expect(state).toEqual({
+        bye: "world",
+        hello: "there",
+        messages: ["hello"],
+      });
+      return {
+        hello: "again",
+        now: 123,
+      };
+    };
+
+    const nodeC = (state: { hello: string }) => {
+      // Unfortunately can't infer input types at runtime :(
+      expect(state).toEqual({
+        bye: "world",
+        hello: "again",
+        messages: ["hello"],
+      });
+      return {};
+    };
+
+    const graph = new StateGraph({
+      stateSchema: StateAnnotation,
+      output: OutputAnnotation,
+    })
+      .addNode("a", nodeA)
+      .addNode("b", nodeB)
+      .addNode("c", nodeC)
+      .addEdge(START, "a")
+      .addEdge("a", "b")
+      .addEdge("b", "c")
+      .compile();
+
+    expect(
+      await graph.invoke({ hello: "there", bye: "world", messages: ["hello"] })
+    ).toEqual({
+      messages: ["hello"],
+    });
+
+    const graphWithInput = new StateGraph({
+      input: StateAnnotation,
+      output: OutputAnnotation,
+    })
+      .addNode("a", nodeA)
+      .addNode("b", nodeB)
+      .addNode("c", nodeC)
+      .addEdge(START, "a")
+      .addEdge("a", "b")
+      .addEdge("b", "c")
+      .compile();
+
+    expect(
+      await graphWithInput.invoke({
+        hello: "there",
+        bye: "world",
+        messages: ["hello"],
+        now: 345, // ignored because not in input schema
+      })
+    ).toEqual({
+      messages: ["hello"],
+    });
+
+    expect(
+      await gatherIterator(
+        graphWithInput.stream({
+          hello: "there",
+          bye: "world",
+          messages: ["hello"],
+          now: 345, // ignored because not in input schema
+        })
+      )
+    ).toEqual([{}, { b: { hello: "again" } }, {}]);
+  });
+
+  it("should use a retry policy", async () => {
+    const checkpointer = new MemorySaverAssertImmutable(); // Replace with actual checkpointer implementation
+
+    let erroredOnce = false;
+    let nonRetryableErrorCount = 0;
+
+    const GraphAnnotation = Annotation.Root({
+      total: Annotation<number>,
+      input: Annotation<number>,
+    });
+
+    const raiseIfAbove10 = ({ total }: typeof GraphAnnotation.State) => {
+      if (total > 2) {
+        if (!erroredOnce) {
+          erroredOnce = true;
+          const error = new Error("I will be retried");
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (error as any).status = 500;
+          throw error;
+        }
+      }
+      if (total > 8) {
+        nonRetryableErrorCount += 1;
+        const error = new Error("Total is too large");
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (error as any).status = 400;
+        throw error;
+      }
+      return { total };
+    };
+
+    const add = ({ input, total }: typeof GraphAnnotation.State) => ({
+      total: input + total,
+    });
+
+    const app = new StateGraph(GraphAnnotation)
+      .addNode("add", add)
+      .addNode("check", raiseIfAbove10, {
+        retryPolicy: {},
+      })
+      .addEdge("__start__", "add")
+      .addEdge("add", "check")
+      .addEdge("check", "__end__")
+      .compile({ checkpointer });
+
+    // total starts out as 0, so output is 0+2=2
+    expect(
+      await app.invoke({ input: 2 }, { configurable: { thread_id: "1" } })
+    ).toEqual({ input: 2, total: 2 });
+    let checkpoint = await checkpointer.get({
+      configurable: { thread_id: "1" },
+    });
+    expect(checkpoint).not.toBeNull();
+    expect(checkpoint?.channel_values.total).toBe(2);
+    expect(erroredOnce).toBe(false);
+    expect(nonRetryableErrorCount).toBe(0);
+
+    // total is now 2, so output is 2+3=5
+    expect(
+      await app.invoke({ input: 3 }, { configurable: { thread_id: "1" } })
+    ).toEqual({ input: 3, total: 5 });
+    expect(erroredOnce).toBeTruthy();
+    let checkpointTuple = await checkpointer.getTuple({
+      configurable: { thread_id: "1" },
+    });
+    expect(checkpointTuple).not.toBeNull();
+    expect(erroredOnce).toBe(true);
+    expect(nonRetryableErrorCount).toBe(0);
+
+    // total is now 2+3=5, so output would be 5+4=9, but raises Error
+    await expect(
+      app.invoke({ input: 4 }, { configurable: { thread_id: "1" } })
+    ).rejects.toThrow("Total is too large");
+
+    // checkpoint is not updated, error is recorded
+    checkpointTuple = await checkpointer.getTuple({
+      configurable: { thread_id: "1" },
+    });
+    expect(checkpointTuple).not.toBeNull();
+    expect(checkpointTuple?.pendingWrites).toEqual([
+      [
+        expect.any(String),
+        "__error__",
+        { message: "Total is too large", name: "Error" },
+      ],
+    ]);
+    expect(nonRetryableErrorCount).toBe(1);
+
+    // on a new thread, total starts out as 0, so output is 0+5=5
+    expect(
+      await app.invoke({ input: 5 }, { configurable: { thread_id: "2" } })
+    ).toEqual({ input: 5, total: 5 });
+    checkpoint = await checkpointer.get({ configurable: { thread_id: "1" } });
+    expect(checkpoint).not.toBeNull();
+    checkpoint = await checkpointer.get({ configurable: { thread_id: "2" } });
+    expect(checkpoint).not.toBeNull();
+    expect(checkpoint?.channel_values.total).toBe(5);
+    expect(nonRetryableErrorCount).toBe(1);
+  });
+
+  it("should allow undefined values returned in a node update", async () => {
+    interface GraphState {
+      test?: string;
+      reducerField?: string;
+    }
+
+    const graphState: StateGraphArgs<GraphState>["channels"] = {
+      test: null,
+      reducerField: {
+        default: () => "",
+        reducer: (x, y?: string) => y ?? x,
+      },
+    };
+
+    const workflow = new StateGraph<GraphState>({ channels: graphState });
+
+    async function updateTest(
+      _state: GraphState
+    ): Promise<Partial<GraphState>> {
+      return {
+        test: "test",
+        reducerField: "should not be wiped",
+      };
+    }
+
+    async function wipeFields(
+      _state: GraphState
+    ): Promise<Partial<GraphState>> {
+      return {
+        test: undefined,
+        reducerField: undefined,
+      };
+    }
+
+    workflow
+      .addNode("updateTest", updateTest)
+      .addNode("wipeFields", wipeFields)
+      .addEdge(START, "updateTest")
+      .addEdge("updateTest", "wipeFields")
+      .addEdge("wipeFields", END);
+
+    const checkpointer = new MemorySaver();
+
+    const app = workflow.compile({ checkpointer });
+    const config: RunnableConfig = {
+      configurable: { thread_id: "102" },
+    };
+    const res = await app.invoke(
+      {
+        messages: ["initial input"],
+      },
+      config
+    );
+    expect(res).toEqual({
+      reducerField: "should not be wiped",
+    });
+    const history = await gatherIterator(app.getStateHistory(config));
+    expect(history).toEqual([
+      {
+        values: {
+          reducerField: "should not be wiped",
+        },
+        next: [],
+        tasks: [],
+        metadata: {
+          source: "loop",
+          writes: {
+            wipeFields: {
+              test: undefined,
+              reducerField: undefined,
+            },
+          },
+          step: 2,
+        },
+        config: {
+          configurable: {
+            thread_id: "102",
+            checkpoint_ns: "",
+            checkpoint_id: expect.any(String),
+          },
+        },
+        createdAt: expect.any(String),
+        parentConfig: {
+          configurable: {
+            thread_id: "102",
+            checkpoint_ns: "",
+            checkpoint_id: expect.any(String),
+          },
+        },
+      },
+      {
+        values: {
+          test: "test",
+          reducerField: "should not be wiped",
+        },
+        next: ["wipeFields"],
+        tasks: [
+          {
+            id: expect.any(String),
+            name: "wipeFields",
+            interrupts: [],
+          },
+        ],
+        metadata: {
+          source: "loop",
+          writes: {
+            updateTest: {
+              test: "test",
+              reducerField: "should not be wiped",
+            },
+          },
+          step: 1,
+        },
+        config: {
+          configurable: {
+            thread_id: "102",
+            checkpoint_ns: "",
+            checkpoint_id: expect.any(String),
+          },
+        },
+        createdAt: expect.any(String),
+        parentConfig: {
+          configurable: {
+            thread_id: "102",
+            checkpoint_ns: "",
+            checkpoint_id: expect.any(String),
+          },
+        },
+      },
+      {
+        values: {
+          reducerField: "",
+        },
+        next: ["updateTest"],
+        tasks: [
+          {
+            id: expect.any(String),
+            name: "updateTest",
+            interrupts: [],
+          },
+        ],
+        metadata: {
+          source: "loop",
+          writes: null,
+          step: 0,
+        },
+        config: {
+          configurable: {
+            thread_id: "102",
+            checkpoint_ns: "",
+            checkpoint_id: expect.any(String),
+          },
+        },
+        createdAt: expect.any(String),
+        parentConfig: {
+          configurable: {
+            thread_id: "102",
+            checkpoint_ns: "",
+            checkpoint_id: expect.any(String),
+          },
+        },
+      },
+      {
+        values: {
+          reducerField: "",
+        },
+        next: ["__start__"],
+        tasks: [
+          {
+            id: expect.any(String),
+            name: "__start__",
+            interrupts: [],
+          },
+        ],
+        metadata: {
+          source: "input",
+          writes: {
+            messages: ["initial input"],
+          },
+          step: -1,
+        },
+        config: {
+          configurable: {
+            thread_id: "102",
+            checkpoint_ns: "",
+            checkpoint_id: expect.any(String),
+          },
+        },
+        createdAt: expect.any(String),
+        parentConfig: undefined,
+      },
+    ]);
+  });
+
+  it("should allow custom configuration values", async () => {
+    const StateAnnotation = Annotation.Root({
+      hello: Annotation<string>,
+    });
+
+    const nodeA = (
+      _: typeof StateAnnotation.State,
+      config?: RunnableConfig
+    ) => {
+      // Unfortunately can't infer input types at runtime :(
+      expect(config?.configurable?.foo).toEqual("bar");
+      return {};
+    };
+
+    const nodeB = (
+      _: typeof StateAnnotation.State,
+      config?: RunnableConfig
+    ) => {
+      expect(config?.configurable?.foo).toEqual("bar");
+      return {
+        hello: "again",
+        now: 123,
+      };
+    };
+
+    const graph = new StateGraph(StateAnnotation)
+      .addNode("a", nodeA)
+      .addNode("b", nodeB)
+      .addEdge(START, "a")
+      .addEdge("a", "b")
+      .compile();
+
+    expect(
+      await graph.invoke({ hello: "there" }, { configurable: { foo: "bar" } })
+    ).toEqual({
+      hello: "again",
+    });
+  });
+
+  it("should allow private state passing between nodes", async () => {
+    const StateAnnotation = Annotation.Root({
+      hello: Annotation<string>,
+    });
+
+    const PrivateAnnotation = Annotation.Root({
+      ...StateAnnotation.spec,
+      privateProp: Annotation<string>,
+    });
+
+    const nodeA = (_: typeof StateAnnotation.State) => {
+      return {
+        privateProp: "secret",
+      };
+    };
+
+    const nodeB = (state: typeof PrivateAnnotation.State) => {
+      expect(state).toEqual({ privateProp: "secret", hello: "there" });
+      return {
+        hello: "again",
+        now: 123,
+      };
+    };
+
+    const graph = new StateGraph(StateAnnotation)
+      .addNode("a", nodeA)
+      .addNode("b", nodeB, { input: PrivateAnnotation })
+      .addEdge(START, "a")
+      .addEdge("a", "b")
+      .compile();
+
+    expect(await graph.invoke({ hello: "there" })).toEqual({
+      hello: "again",
+    });
   });
 });
 
@@ -3111,6 +3745,59 @@ describe("MessageGraph", () => {
       .addEdge("action", "agent")
       .compile();
 
+    expect(app.getGraph().toJSON()).toMatchObject({
+      nodes: expect.arrayContaining([
+        {
+          id: "__start__",
+          type: "schema",
+          data: {
+            $schema: "http://json-schema.org/draft-07/schema#",
+            title: undefined,
+          },
+        },
+        {
+          id: "agent",
+          type: "runnable",
+          data: {
+            id: ["langchain", "chat_models", "fake", "FakeChatModel"],
+            name: "FakeChatModel",
+          },
+        },
+        {
+          id: "action",
+          type: "runnable",
+          data: {
+            id: ["langchain_core", "runnables", "RunnableLambda"],
+            name: "RunnableLambda",
+          },
+        },
+        {
+          id: "__end__",
+          type: "schema",
+          data: {
+            $schema: "http://json-schema.org/draft-07/schema#",
+            title: undefined,
+          },
+        },
+      ]),
+      edges: expect.arrayContaining([
+        { source: "__start__", target: "agent" },
+        { source: "action", target: "agent" },
+        {
+          source: "agent",
+          target: "action",
+          data: "continue",
+          conditional: true,
+        },
+        {
+          source: "agent",
+          target: "__end__",
+          data: "end",
+          conditional: true,
+        },
+      ]),
+    });
+
     const result = await app.invoke(
       new HumanMessage("what is the weather in sf?")
     );
@@ -3221,6 +3908,45 @@ describe("MessageGraph", () => {
       .addEdge("action", "agent")
       .compile();
 
+    expect(app.getGraph().toJSON()).toMatchObject({
+      nodes: expect.arrayContaining([
+        expect.objectContaining({ id: "__start__", type: "schema" }),
+        expect.objectContaining({ id: "__end__", type: "schema" }),
+        {
+          id: "agent",
+          type: "runnable",
+          data: {
+            id: ["langchain", "chat_models", "fake", "FakeChatModel"],
+            name: "FakeChatModel",
+          },
+        },
+        {
+          id: "action",
+          type: "runnable",
+          data: {
+            id: ["langchain_core", "runnables", "RunnableLambda"],
+            name: "RunnableLambda",
+          },
+        },
+      ]),
+      edges: expect.arrayContaining([
+        { source: "__start__", target: "agent" },
+        { source: "action", target: "agent" },
+        {
+          source: "agent",
+          target: "action",
+          data: "continue",
+          conditional: true,
+        },
+        {
+          source: "agent",
+          target: "__end__",
+          data: "end",
+          conditional: true,
+        },
+      ]),
+    });
+
     const stream = await app.stream([
       new HumanMessage("what is the weather in sf?"),
     ]);
@@ -3302,7 +4028,7 @@ it("checkpoint events", async () => {
           writes: { my_key: "value", market: "DE" },
         },
         next: ["__start__"],
-        tasks: [{ id: expect.any(String), name: "__start__" }],
+        tasks: [{ id: expect.any(String), name: "__start__", interrupts: [] }],
       },
     },
     {
@@ -3327,10 +4053,10 @@ it("checkpoint events", async () => {
         metadata: {
           source: "loop",
           step: 0,
-          writes: undefined,
+          writes: null,
         },
         next: ["prepare"],
-        tasks: [{ id: expect.any(String), name: "prepare" }],
+        tasks: [{ id: expect.any(String), name: "prepare", interrupts: [] }],
       },
     },
     {
@@ -3342,6 +4068,7 @@ it("checkpoint events", async () => {
         name: "prepare",
         input: { my_key: "value", market: "DE" },
         triggers: ["start:prepare"],
+        interrupts: [],
       },
     },
     {
@@ -3379,7 +4106,9 @@ it("checkpoint events", async () => {
           writes: { prepare: { my_key: " prepared" } },
         },
         next: ["tool_two_slow"],
-        tasks: [{ id: expect.any(String), name: "tool_two_slow" }],
+        tasks: [
+          { id: expect.any(String), name: "tool_two_slow", interrupts: [] },
+        ],
       },
     },
     {
@@ -3391,6 +4120,7 @@ it("checkpoint events", async () => {
         name: "tool_two_slow",
         input: { my_key: "value prepared", market: "DE" },
         triggers: ["branch:prepare:condition:tool_two_slow"],
+        interrupts: [],
       },
     },
     {
@@ -3428,7 +4158,7 @@ it("checkpoint events", async () => {
           writes: { tool_two_slow: { my_key: " slow" } },
         },
         next: ["finish"],
-        tasks: [{ id: expect.any(String), name: "finish" }],
+        tasks: [{ id: expect.any(String), name: "finish", interrupts: [] }],
       },
     },
     {
@@ -3440,6 +4170,7 @@ it("checkpoint events", async () => {
         name: "finish",
         input: { my_key: "value prepared slow", market: "DE" },
         triggers: ["tool_two_slow"],
+        interrupts: [],
       },
     },
     {
@@ -3504,22 +4235,6 @@ it("StateGraph start branch then end", async () => {
     market: string;
   };
 
-  const invalidBuilder = new StateGraph<State>({
-    channels: {
-      my_key: { reducer: (x: string, y: string) => x + y },
-      market: null,
-    },
-  })
-    .addNode("tool_two_slow", (_: State) => ({ my_key: ` slow` }))
-    .addNode("tool_two_fast", (_: State) => ({ my_key: ` fast` }))
-    .addConditionalEdges(START, (state: State) =>
-      state.market === "DE" ? "tool_two_slow" : "tool_two_fast"
-    );
-
-  expect(() => invalidBuilder.compile()).toThrowError(
-    "Node `tool_two_slow` is a dead-end"
-  );
-
   const toolTwoBuilder = new StateGraph<State>({
     channels: {
       my_key: { reducer: (x: string, y: string) => x + y },
@@ -3532,9 +4247,7 @@ it("StateGraph start branch then end", async () => {
       source: START,
       path: (state: State) =>
         state.market === "DE" ? "tool_two_slow" : "tool_two_fast",
-    })
-    .addEdge("tool_two_fast", END)
-    .addEdge("tool_two_slow", END);
+    });
 
   const toolTwo = toolTwoBuilder.compile();
 
@@ -3580,6 +4293,7 @@ it("StateGraph start branch then end", async () => {
     {
       source: "loop",
       step: 0,
+      writes: null,
     },
     {
       source: "input",
@@ -3590,12 +4304,12 @@ it("StateGraph start branch then end", async () => {
   expect(await toolTwoWithCheckpointer.getState(thread1)).toEqual({
     values: { my_key: "value ⛰️", market: "DE" },
     next: ["tool_two_slow"],
-    tasks: [{ id: expect.any(String), name: "tool_two_slow" }],
+    tasks: [{ id: expect.any(String), name: "tool_two_slow", interrupts: [] }],
     config: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread1))!
       .config,
     createdAt: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread1))!
       .checkpoint.ts,
-    metadata: { source: "loop", step: 0 },
+    metadata: { source: "loop", step: 0, writes: null },
     parentConfig: (
       await last(
         toolTwoWithCheckpointer.checkpointer!.list(thread1, { limit: 2 })
@@ -3640,12 +4354,12 @@ it("StateGraph start branch then end", async () => {
   expect(await toolTwoWithCheckpointer.getState(thread2)).toEqual({
     values: { my_key: "value", market: "US" },
     next: ["tool_two_fast"],
-    tasks: [{ id: expect.any(String), name: "tool_two_fast" }],
+    tasks: [{ id: expect.any(String), name: "tool_two_fast", interrupts: [] }],
     config: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread2))!
       .config,
     createdAt: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread2))!
       .checkpoint.ts,
-    metadata: { source: "loop", step: 0 },
+    metadata: { source: "loop", step: 0, writes: null },
     parentConfig: (
       await last(
         toolTwoWithCheckpointer.checkpointer!.list(thread2, { limit: 2 })
@@ -3690,12 +4404,12 @@ it("StateGraph start branch then end", async () => {
   expect(await toolTwoWithCheckpointer.getState(thread3)).toEqual({
     values: { my_key: "value", market: "US" },
     next: ["tool_two_fast"],
-    tasks: [{ id: expect.any(String), name: "tool_two_fast" }],
+    tasks: [{ id: expect.any(String), name: "tool_two_fast", interrupts: [] }],
     config: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread3))!
       .config,
     createdAt: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread3))!
       .checkpoint.ts,
-    metadata: { source: "loop", step: 0 },
+    metadata: { source: "loop", step: 0, writes: null },
     parentConfig: (
       await last(
         toolTwoWithCheckpointer.checkpointer!.list(thread3, { limit: 2 })
@@ -3707,7 +4421,7 @@ it("StateGraph start branch then end", async () => {
   expect(await toolTwoWithCheckpointer.getState(thread3)).toEqual({
     values: { my_key: "valuekey", market: "US" },
     next: ["tool_two_fast"],
-    tasks: [{ id: expect.any(String), name: "tool_two_fast" }],
+    tasks: [{ id: expect.any(String), name: "tool_two_fast", interrupts: [] }],
     config: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread3))!
       .config,
     createdAt: (await toolTwoWithCheckpointer.checkpointer!.getTuple(thread3))!
@@ -3797,6 +4511,55 @@ it("StateGraph branch then node", async () => {
     .addEdge("finish", END);
 
   const tool = toolBuilder.compile();
+
+  expect(tool.getGraph().toJSON()).toMatchObject({
+    nodes: expect.arrayContaining([
+      expect.objectContaining({ id: "__start__", type: "schema" }),
+      expect.objectContaining({ id: "__end__", type: "schema" }),
+      {
+        id: "prepare",
+        type: "runnable",
+        data: {
+          id: ["langchain_core", "runnables", "RunnableLambda"],
+          name: "RunnableLambda",
+        },
+      },
+      {
+        id: "tool_two_slow",
+        type: "runnable",
+        data: {
+          id: ["langchain_core", "runnables", "RunnableLambda"],
+          name: "RunnableLambda",
+        },
+      },
+      {
+        id: "tool_two_fast",
+        type: "runnable",
+        data: {
+          id: ["langchain_core", "runnables", "RunnableLambda"],
+          name: "RunnableLambda",
+        },
+      },
+      {
+        id: "finish",
+        type: "runnable",
+        data: {
+          id: ["langchain_core", "runnables", "RunnableLambda"],
+          name: "RunnableLambda",
+        },
+      },
+    ]),
+    edges: expect.arrayContaining([
+      { source: "__start__", target: "prepare" },
+      { source: "tool_two_fast", target: "finish" },
+      { source: "tool_two_slow", target: "finish" },
+      { source: "finish", target: "__end__" },
+      { source: "prepare", target: "tool_two_slow", conditional: true },
+      { source: "prepare", target: "tool_two_fast", conditional: true },
+      { source: "prepare", target: "finish", conditional: true },
+      { source: "prepare", target: "__end__", conditional: true },
+    ]),
+  });
 
   expect(await tool.invoke({ my_key: "value", market: "DE" })).toEqual({
     my_key: "value prepared slow finished",

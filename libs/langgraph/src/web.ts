@@ -7,17 +7,29 @@ export {
   type CompiledStateGraph,
   MessageGraph,
   messagesStateReducer,
+  type Messages,
   Annotation,
+  type AnnotationRoot,
+  type StateDefinition,
+  type SingleReducer,
   type StateType,
   type UpdateType,
+  type NodeType,
   type CompiledGraph,
 } from "./graph/index.js";
+export * from "./errors.js";
 export {
-  GraphRecursionError,
-  GraphValueError,
-  InvalidUpdateError,
-  EmptyChannelError,
-} from "./errors.js";
+  BaseChannel,
+  type BinaryOperator,
+  BinaryOperatorAggregate,
+  type AnyValue,
+  type WaitForNames,
+  type DynamicBarrierValue,
+  type LastValue,
+  type NamedBarrierValue,
+  type Topic,
+} from "./channels/index.js";
+export { type RetryPolicy } from "./pregel/utils.js";
 export { Send } from "./constants.js";
 
 export {

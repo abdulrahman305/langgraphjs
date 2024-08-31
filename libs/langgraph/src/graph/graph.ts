@@ -9,14 +9,13 @@ import {
   Node as RunnableGraphNode,
   Graph as RunnableGraph,
 } from "@langchain/core/runnables/graph";
-import { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
+import { All, BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import { z } from "zod";
 import { PregelNode } from "../pregel/read.js";
 import { Channel, Pregel } from "../pregel/index.js";
 import type { PregelParams } from "../pregel/types.js";
 import { BaseChannel } from "../channels/base.js";
 import { EphemeralValue } from "../channels/ephemeral_value.js";
-import { All } from "../pregel/types.js";
 import { ChannelWrite, PASSTHROUGH } from "../pregel/write.js";
 import {
   _isSend,
@@ -35,7 +34,7 @@ export const END = "__end__";
 export interface BranchOptions<IO, N extends string> {
   source: N;
   path: Branch<IO, N>["condition"];
-  pathMap?: Record<string, N | typeof END> | N[];
+  pathMap?: Record<string, N | typeof END> | (N | typeof END)[];
 }
 
 export class Branch<IO, N extends string> {
@@ -100,14 +99,25 @@ export class Branch<IO, N extends string> {
   }
 }
 
+export type NodeSpec<RunInput, RunOutput> = {
+  runnable: Runnable<RunInput, RunOutput>;
+  metadata?: Record<string, unknown>;
+};
+
+export type AddNodeOptions = { metadata?: Record<string, unknown> };
+
 export class Graph<
   N extends string = typeof END,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   RunInput = any,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  RunOutput = any
+  RunOutput = any,
+  NodeSpecType extends NodeSpec<RunInput, RunOutput> = NodeSpec<
+    RunInput,
+    RunOutput
+  >
 > {
-  nodes: Record<N, Runnable<RunInput, RunOutput>>;
+  nodes: Record<N, NodeSpecType>;
 
   edges: Set<[N | typeof START, N | typeof END]>;
 
@@ -120,12 +130,12 @@ export class Graph<
   supportMultipleEdges = false;
 
   constructor() {
-    this.nodes = {} as Record<N, Runnable<RunInput, RunOutput>>;
+    this.nodes = {} as Record<N, NodeSpecType>;
     this.edges = new Set();
     this.branches = {};
   }
 
-  private warnIfCompiled(message: string): void {
+  protected warnIfCompiled(message: string): void {
     if (this.compiled) {
       console.warn(message);
     }
@@ -137,7 +147,8 @@ export class Graph<
 
   addNode<K extends string, NodeInput = RunInput>(
     key: K,
-    action: RunnableLike<NodeInput, RunOutput>
+    action: RunnableLike<NodeInput, RunOutput>,
+    options?: AddNodeOptions
   ): Graph<N | K, RunInput, RunOutput> {
     if (key.includes(CHECKPOINT_NAMESPACE_SEPARATOR)) {
       throw new Error(
@@ -155,12 +166,15 @@ export class Graph<
       throw new Error(`Node \`${key}\` is reserved.`);
     }
 
-    this.nodes[key as unknown as N] = _coerceToRunnable<RunInput, RunOutput>(
-      // Account for arbitrary state due to Send API
-      action as RunnableLike<RunInput, RunOutput>
-    );
+    this.nodes[key as unknown as N] = {
+      runnable: _coerceToRunnable<RunInput, RunOutput>(
+        // Account for arbitrary state due to Send API
+        action as RunnableLike<RunInput, RunOutput>
+      ),
+      metadata: options?.metadata,
+    } as NodeSpecType;
 
-    return this as Graph<N | K, RunInput, RunOutput>;
+    return this as Graph<N | K, RunInput, RunOutput, NodeSpecType>;
   }
 
   addEdge(startKey: N | typeof START, endKey: N | typeof END): this {
@@ -278,7 +292,7 @@ export class Graph<
     });
 
     // attach nodes, edges and branches
-    for (const [key, node] of Object.entries<Runnable<RunInput, RunOutput>>(
+    for (const [key, node] of Object.entries<NodeSpec<RunInput, RunOutput>>(
       this.nodes
     )) {
       compiled.attachNode(key as N, node);
@@ -300,12 +314,6 @@ export class Graph<
     const allSources = new Set([...this.allEdges].map(([src, _]) => src));
     for (const [start] of Object.entries(this.branches)) {
       allSources.add(start);
-    }
-    // validate sources
-    for (const node of Object.keys(this.nodes)) {
-      if (!allSources.has(node)) {
-        throw new Error(`Node \`${node}\` is a dead-end`);
-      }
     }
     for (const source of allSources) {
       if (source !== START && !(source in this.nodes)) {
@@ -385,13 +393,14 @@ export class CompiledGraph<
     this.builder = builder;
   }
 
-  attachNode(key: N, node: Runnable<RunInput, RunOutput>): void {
+  attachNode(key: N, node: NodeSpec<RunInput, RunOutput>): void {
     this.channels[key] = new EphemeralValue();
     this.nodes[key] = new PregelNode({
       channels: [],
       triggers: [],
+      metadata: node.metadata,
     })
-      .pipe(node)
+      .pipe(node.runnable)
       .pipe(
         new ChannelWrite([{ channel: key, value: PASSTHROUGH }], [TAG_HIDDEN])
       );
@@ -477,14 +486,16 @@ export class CompiledGraph<
         END
       ),
     };
-    for (const [key, node] of Object.entries<Runnable>(this.builder.nodes)) {
+    for (const [key, node] of Object.entries<NodeSpec<unknown, unknown>>(
+      this.builder.nodes
+    )) {
       if (config?.xray) {
         const subgraph = isCompiledGraph(node)
           ? node.getGraph({
               ...config,
               xray: typeof xray === "number" && xray > 0 ? xray - 1 : xray,
             })
-          : node.getGraph(config);
+          : node.runnable.getGraph(config);
         subgraph.trimFirstNode();
         subgraph.trimLastNode();
         if (Object.keys(subgraph.nodes).length > 1) {
@@ -496,12 +507,12 @@ export class CompiledGraph<
             startNodes[key] = newStartNode;
           }
         } else {
-          const newNode = graph.addNode(node, key);
+          const newNode = graph.addNode(node.runnable, key);
           startNodes[key] = newNode;
           endNodes[key] = newNode;
         }
       } else {
-        const newNode = graph.addNode(node, key);
+        const newNode = graph.addNode(node.runnable, key);
         startNodes[key] = newNode;
         endNodes[key] = newNode;
       }

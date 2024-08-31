@@ -64,6 +64,7 @@ plugins:
       options: "typedoc.json"
       name: "API Reference"
       title_link: "/" # optional, default: '/'
+
 nav:
   - Home:
       - "index.md"
@@ -99,25 +100,34 @@ nav:
       - Persistence:
           - Add persistence ("memory") to your graph: "how-tos/persistence.ipynb"
           - View and update past graph state: "how-tos/time-travel.ipynb"
-          - Manage conversation history: how-tos/manage-conversation-history.ipynb
+          - Manage conversation history: "how-tos/manage-conversation-history.ipynb"
           - Create a custom checkpointer using Postgres: "how-tos/persistence-postgres.ipynb"
           - How to delete messages: "how-tos/delete-messages.ipynb"
+          - Add summary of the conversation history: "how-tos/add-summary-conversation-history.ipynb"
       - Human-in-the-loop:
-          - Add human-in-the-loop: "how-tos/human-in-the-loop.ipynb"
-          - Add breakpoints: how-tos/breakpoints.ipynb
-          - Wait for user input: how-tos/wait-user-input.ipynb
-          - View and update past graph state: how-tos/time-travel.ipynb
-          - Edit graph state: how-tos/edit-graph-state.ipynb
+          - Add breakpoints: "how-tos/breakpoints.ipynb"
+          - Add dynamic breakpoints: "how-tos/dynamic_breakpoints.ipynb"
+          - Wait for user input: "how-tos/wait-user-input.ipynb"
+          - View and update past graph state: "how-tos/time-travel.ipynb"
+          - Edit graph state: "how-tos/edit-graph-state.ipynb"
+          - Review tool calls: "how-tos/review-tool-calls.ipynb"
       - Streaming:
           - Stream full state: "how-tos/stream-values.ipynb"
           - Stream state updates: "how-tos/stream-updates.ipynb"
           - Stream LLM tokens: "how-tos/stream-tokens.ipynb"
           - Stream LLM tokens without LangChain models: "how-tos/streaming-tokens-without-langchain.ipynb"
+          - Stream events from within a tool: "how-tos/streaming-events-from-within-tools.ipynb"
+          - Stream from the final node: "how-tos/streaming-from-final-node.ipynb"
       - Tool calling:
-          - Call tools using ToolNode: how-tos/tool-calling.ipynb
-          - Handle tool calling errors: how-tos/tool-calling-errors.ipynb
-          - Force an agent to call a tool: how-tos/force-calling-a-tool-first.ipynb
+          - Call tools using ToolNode: "how-tos/tool-calling.ipynb"
+          - Handle tool calling errors: "how-tos/tool-calling-errors.ipynb"
+          - Force an agent to call a tool: "how-tos/force-calling-a-tool-first.ipynb"
           # - Pass graph state to tools: how-tos/pass-run-time-values-to-tools.ipynb TODO
+      - Prebuilt ReAct Agent:
+          - Create a ReAct agent: "how-tos/create-react-agent.ipynb"
+          - Add memory to a ReAct agent: "how-tos/react-memory.ipynb"
+          - Add a system prompt to a ReAct agent: "how-tos/react-system-prompt.ipynb"
+          - Add Human-in-the-loop to a ReAct agent: "how-tos/react-human-in-the-loop.ipynb"
       - Other:
           - Add runtime configuration: "how-tos/configuration.ipynb"
           - Force an agent to call a tool: "how-tos/force-calling-a-tool-first.ipynb"
@@ -125,6 +135,7 @@ nav:
           - Handle tool calling errors: "how-tos/tool-calling-errors.ipynb"
           - Have agent respond in structured format: "how-tos/respond-in-format.ipynb"
           - Manage agent steps: "how-tos/managing-agent-steps.ipynb"
+          - Add node retry policies: "how-tos/node-retry-policies.ipynb"
   - "Conceptual Guides":
       - "concepts/index.md"
       - LangGraph for Agentic Applications: concepts/high_level.md
@@ -194,3 +205,11 @@ extra:
       link: https://github.com/langchain-ai/langgraphjs
     - icon: fontawesome/brands/twitter
       link: https://twitter.com/LangChainAI
+
+validation:
+  omitted_files: warn
+  unrecognized_links: warn
+  nav:
+    not_found: warn
+  links:
+    not_found: warn

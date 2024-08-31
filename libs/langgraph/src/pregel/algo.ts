@@ -6,6 +6,7 @@ import {
 } from "@langchain/core/runnables";
 import { CallbackManagerForChainRun } from "@langchain/core/callbacks/manager";
 import {
+  All,
   BaseCheckpointSaver,
   Checkpoint,
   ReadonlyCheckpoint,
@@ -13,6 +14,7 @@ import {
   type PendingWrite,
   type PendingWriteValue,
   uuid5,
+  maxChannelVersion,
 } from "@langchain/langgraph-checkpoint";
 import {
   BaseChannel,
@@ -35,7 +37,7 @@ import {
   TAG_HIDDEN,
   TASKS,
 } from "../constants.js";
-import { All, PregelExecutableTask, PregelTaskDescription } from "./types.js";
+import { PregelExecutableTask, PregelTaskDescription } from "./types.js";
 import { EmptyChannelError, InvalidUpdateError } from "../errors.js";
 import { _getIdMetadata, getNullChannelVersion } from "./utils.js";
 
@@ -55,62 +57,6 @@ export type WritesProtocol<C = string> = {
 export const increment = (current?: number) => {
   return current !== undefined ? current + 1 : 1;
 };
-
-export async function* executeTasks(
-  tasks: Record<
-    string,
-    () => Promise<{
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      task: PregelExecutableTask<any, any>;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      result: any;
-      error: Error;
-    }>
-  >,
-  stepTimeout?: number,
-  signal?: AbortSignal
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-): AsyncGenerator<PregelExecutableTask<any, any>> {
-  if (stepTimeout && signal) {
-    if ("any" in AbortSignal) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      signal = (AbortSignal as any).any([
-        signal,
-        AbortSignal.timeout(stepTimeout),
-      ]);
-    }
-  } else if (stepTimeout) {
-    signal = AbortSignal.timeout(stepTimeout);
-  }
-
-  // Abort if signal is aborted
-  signal?.throwIfAborted();
-
-  // Start all tasks
-  const executingTasks = Object.fromEntries(
-    Object.entries(tasks).map(([taskId, task]) => {
-      return [taskId, task()];
-    })
-  );
-  let listener: () => void;
-  const signalPromise = new Promise<never>((_resolve, reject) => {
-    listener = () => reject(new Error("Abort"));
-    signal?.addEventListener("abort", listener);
-  }).finally(() => signal?.removeEventListener("abort", listener));
-
-  while (Object.keys(executingTasks).length > 0) {
-    const { task, error } = await Promise.race([
-      ...Object.values(executingTasks),
-      signalPromise,
-    ]);
-    if (error !== undefined) {
-      // TODO: don't stop others if exception is interrupt
-      throw error;
-    }
-    yield task;
-    delete executingTasks[task.id];
-  }
-}
 
 export function shouldInterrupt<N extends PropertyKey, C extends PropertyKey>(
   checkpoint: Checkpoint,
@@ -212,9 +158,11 @@ export function _applyWrites<Cc extends Record<string, BaseChannel>>(
   }
 
   // Find the highest version of all channels
-  let maxVersion: number | undefined;
+  let maxVersion: string | number | undefined;
   if (Object.keys(checkpoint.channel_versions).length > 0) {
-    maxVersion = Math.max(...Object.values(checkpoint.channel_versions));
+    maxVersion = maxChannelVersion(
+      ...Object.values(checkpoint.channel_versions)
+    );
   }
 
   // Consume all channels that were read
@@ -265,7 +213,9 @@ export function _applyWrites<Cc extends Record<string, BaseChannel>>(
   // find the highest version of all channels
   maxVersion = undefined;
   if (Object.keys(checkpoint.channel_versions).length > 0) {
-    maxVersion = Math.max(...Object.values(checkpoint.channel_versions));
+    maxVersion = maxChannelVersion(
+      ...Object.values(checkpoint.channel_versions)
+    );
   }
 
   const updatedChannels: Set<string> = new Set();
@@ -426,10 +376,11 @@ export function _prepareNextTasks<
             }
           ),
           id: taskId,
+          retry_policy: proc.retryPolicy,
         });
       }
     } else {
-      taskDescriptions.push({ id: taskId, name: packet.node });
+      taskDescriptions.push({ id: taskId, name: packet.node, interrupts: [] });
     }
   }
 
@@ -521,10 +472,11 @@ export function _prepareNextTasks<
               }
             ),
             id: taskId,
+            retry_policy: proc.retryPolicy,
           });
         }
       } else {
-        taskDescriptions.push({ id: taskId, name });
+        taskDescriptions.push({ id: taskId, name, interrupts: [] });
       }
     }
   }

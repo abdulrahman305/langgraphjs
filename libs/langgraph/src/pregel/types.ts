@@ -1,11 +1,14 @@
 import type { Runnable, RunnableConfig } from "@langchain/core/runnables";
 import type {
+  All,
   PendingWrite,
   CheckpointMetadata,
   BaseCheckpointSaver,
 } from "@langchain/langgraph-checkpoint";
 import type { BaseChannel } from "../channels/base.js";
 import type { PregelNode } from "./read.js";
+import { RetryPolicy } from "./utils.js";
+import { Interrupt } from "../constants.js";
 
 export type StreamMode = "values" | "updates" | "debug";
 
@@ -63,6 +66,8 @@ export interface PregelInterface<
   debug?: boolean;
 
   checkpointer?: BaseCheckpointSaver;
+
+  retryPolicy?: RetryPolicy;
 }
 
 export type PregelParams<
@@ -74,6 +79,7 @@ export interface PregelTaskDescription {
   readonly id: string;
   readonly name: string;
   readonly error?: unknown;
+  readonly interrupts: Interrupt[];
 }
 
 export interface PregelExecutableTask<
@@ -84,9 +90,9 @@ export interface PregelExecutableTask<
   readonly input: unknown;
   readonly proc: Runnable;
   readonly writes: PendingWrite<C>[];
-  readonly config: RunnableConfig | undefined;
+  readonly config?: RunnableConfig;
   readonly triggers: Array<string>;
-  readonly retry_policy?: string;
+  readonly retry_policy?: RetryPolicy;
   readonly id: string;
 }
 
@@ -122,5 +128,3 @@ export interface StateSnapshot {
    */
   readonly tasks: PregelTaskDescription[];
 }
-
-export type All = "*";
