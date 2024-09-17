@@ -231,7 +231,7 @@ export function _applyWrites<Cc extends Record<string, BaseChannel>>(
           throw new InvalidUpdateError(
             `Invalid update for channel ${chan} with values ${JSON.stringify(
               vals
-            )}`
+            )}: ${e.message}`
           );
         } else {
           throw e;
@@ -513,16 +513,16 @@ function _procInput(
     }
   } else if (typeof proc.channels === "object") {
     val = {};
-    try {
-      for (const [k, chan] of Object.entries(proc.channels)) {
+    for (const [k, chan] of Object.entries(proc.channels)) {
+      try {
         val[k] = readChannel(channels, chan, !proc.triggers.includes(chan));
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } catch (e: any) {
-      if (e.name === EmptyChannelError.unminifiable_name) {
-        return;
-      } else {
-        throw e;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } catch (e: any) {
+        if (e.name === EmptyChannelError.unminifiable_name) {
+          continue;
+        } else {
+          throw e;
+        }
       }
     }
   } else {
