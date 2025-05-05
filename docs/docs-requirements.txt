@@ -8,3 +8,4 @@ mkdocs-material[imaging]
 mkdocs-typedoc
 markdown-include
 markdown-callouts
+setuptools>=78.1.1 # not directly required, pinned by Snyk to avoid a vulnerability
