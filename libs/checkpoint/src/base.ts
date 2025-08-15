@@ -6,7 +6,7 @@ import type {
   CheckpointPendingWrite,
   CheckpointMetadata,
 } from "./types.js";
-import type { ChannelProtocol, SendProtocol } from "./serde/types.js";
+import { ERROR, INTERRUPT, RESUME, SCHEDULED } from "./serde/types.js";
 import { JsonPlusSerializer } from "./serde/jsonplus.js";
 
 type ChannelVersion = number | string;
@@ -18,7 +18,7 @@ export interface Checkpoint<
   C extends string = string
 > {
   /**
-   * Version number
+   * The version of the checkpoint format. Currently 4
    */
   v: number;
   /**
@@ -41,11 +41,6 @@ export interface Checkpoint<
    * @default {}
    */
   versions_seen: Record<N, Record<C, ChannelVersion>>;
-  /**
-   * List of packets sent to nodes but not yet processed.
-   * Cleared by the next checkpoint.
-   */
-  pending_sends: SendProtocol[];
 }
 
 export interface ReadonlyCheckpoint extends Readonly<Checkpoint> {
@@ -77,13 +72,12 @@ export function deepCopy<T>(obj: T): T {
 /** @hidden */
 export function emptyCheckpoint(): Checkpoint {
   return {
-    v: 1,
+    v: 4,
     id: uuid6(-2),
     ts: new Date().toISOString(),
     channel_values: {},
     channel_versions: {},
     versions_seen: {},
-    pending_sends: [],
   };
 }
 
@@ -96,7 +90,6 @@ export function copyCheckpoint(checkpoint: ReadonlyCheckpoint): Checkpoint {
     channel_values: { ...checkpoint.channel_values },
     channel_versions: { ...checkpoint.channel_versions },
     versions_seen: deepCopy(checkpoint.versions_seen),
-    pending_sends: [...checkpoint.pending_sends],
   };
 }
 
@@ -153,12 +146,18 @@ export abstract class BaseCheckpointSaver<V extends string | number = number> {
   ): Promise<void>;
 
   /**
+   * Delete all checkpoints and writes associated with a specific thread ID.
+   * @param threadId The thread ID whose checkpoints should be deleted.
+   */
+  abstract deleteThread(threadId: string): Promise<void>;
+
+  /**
    * Generate the next version ID for a channel.
    *
    * Default is to use integer versions, incrementing by 1. If you override, you can use str/int/float versions,
    * as long as they are monotonically increasing.
    */
-  getNextVersion(current: V | undefined, _channel: ChannelProtocol): V {
+  getNextVersion(current: V | undefined): V {
     if (typeof current === "string") {
       throw new Error("Please override this method to use string versions.");
     }
@@ -186,4 +185,24 @@ export function maxChannelVersion(
     if (idx === 0) return version;
     return compareChannelVersions(max, version) >= 0 ? max : version;
   });
+}
+
+/**
+ * Mapping from error type to error index.
+ * Regular writes just map to their index in the list of writes being saved.
+ * Special writes (e.g. errors) map to negative indices, to avoid those writes from
+ * conflicting with regular writes.
+ * Each Checkpointer implementation should use this mapping in put_writes.
+ */
+export const WRITES_IDX_MAP: Record<string, number> = {
+  [ERROR]: -1,
+  [SCHEDULED]: -2,
+  [INTERRUPT]: -3,
+  [RESUME]: -4,
+};
+
+export function getCheckpointId(config: RunnableConfig): string {
+  return (
+    config.configurable?.checkpoint_id || config.configurable?.thread_ts || ""
+  );
 }

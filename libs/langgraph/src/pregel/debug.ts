@@ -3,20 +3,23 @@ import {
   CheckpointMetadata,
   CheckpointPendingWrite,
   PendingWrite,
-  uuid5,
 } from "@langchain/langgraph-checkpoint";
 import { BaseChannel } from "../channels/base.js";
 import {
   ERROR,
   Interrupt,
   INTERRUPT,
+  RETURN,
   TAG_HIDDEN,
-  TASK_NAMESPACE,
 } from "../constants.js";
 import { EmptyChannelError } from "../errors.js";
-import { PregelExecutableTask, PregelTaskDescription } from "./types.js";
+import {
+  PregelExecutableTask,
+  PregelTaskDescription,
+  StateSnapshot,
+} from "./types.js";
 import { readChannels } from "./io.js";
-import { _getIdMetadata } from "./utils.js";
+import { findSubgraphPregel } from "./utils/subgraph.js";
 
 type ConsoleColors = {
   start: string;
@@ -45,7 +48,7 @@ const COLORS_MAP: ConsoleColorMap = {
 /**
  * Wrap some text in a color for printing to the console.
  */
-const wrap = (color: ConsoleColors, text: string): string =>
+export const wrap = (color: ConsoleColors, text: string): string =>
   `${color.start}${text}${color.end}`;
 
 export function printCheckpoint<Value>(
@@ -65,7 +68,7 @@ export function printCheckpoint<Value>(
   );
 }
 
-function* _readChannels<Value>(
+export function* _readChannels<Value>(
   channels: Record<string, BaseChannel<Value>>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): IterableIterator<[string, any]> {
@@ -85,20 +88,10 @@ function* _readChannels<Value>(
 }
 
 export function* mapDebugTasks<N extends PropertyKey, C extends PropertyKey>(
-  step: number,
   tasks: readonly PregelExecutableTask<N, C>[]
 ) {
-  const ts = new Date().toISOString();
   for (const { id, name, input, config, triggers, writes } of tasks) {
     if (config?.tags?.includes(TAG_HIDDEN)) continue;
-
-    const metadata = { ...config?.metadata };
-    const idMetadata = _getIdMetadata({
-      langgraph_step: metadata.langgraph_step,
-      langgraph_node: metadata.langgraph_node,
-      langgraph_triggers: metadata.langgraph_triggers,
-      langgraph_task_idx: metadata.langgraph_task_idx,
-    });
 
     const interrupts = writes
       .filter(([writeId, n]) => {
@@ -107,18 +100,7 @@ export function* mapDebugTasks<N extends PropertyKey, C extends PropertyKey>(
       .map(([, v]) => {
         return v;
       });
-    yield {
-      type: "task",
-      timestamp: ts,
-      step,
-      payload: {
-        id: uuid5(JSON.stringify([name, step, idMetadata]), TASK_NAMESPACE),
-        name,
-        input,
-        triggers,
-        interrupts,
-      },
-    };
+    yield { id, name, input, triggers, interrupts };
   }
 }
 
@@ -126,45 +108,38 @@ export function* mapDebugTaskResults<
   N extends PropertyKey,
   C extends PropertyKey
 >(
-  step: number,
   tasks: readonly [PregelExecutableTask<N, C>, PendingWrite<C>[]][],
   streamChannels: PropertyKey | Array<PropertyKey>
 ) {
-  const ts = new Date().toISOString();
-  for (const [{ name, config }, writes] of tasks) {
+  for (const [{ id, name, config }, writes] of tasks) {
     if (config?.tags?.includes(TAG_HIDDEN)) continue;
-
-    const metadata = { ...config?.metadata };
-    const idMetadata = _getIdMetadata(metadata);
-
     yield {
-      type: "task_result",
-      timestamp: ts,
-      step,
-      payload: {
-        id: uuid5(JSON.stringify([name, step, idMetadata]), TASK_NAMESPACE),
-        name,
-        result: writes.filter(([channel]) =>
-          Array.isArray(streamChannels)
-            ? streamChannels.includes(channel)
-            : channel === streamChannels
-        ),
-      },
+      id,
+      name,
+      result: writes.filter(([channel]) => {
+        return Array.isArray(streamChannels)
+          ? streamChannels.includes(channel)
+          : channel === streamChannels;
+      }),
+      interrupts: writes.filter((w) => w[0] === INTERRUPT).map((w) => w[1]),
     };
   }
 }
+
+type ChannelKey = string | number | symbol;
 
 export function* mapDebugCheckpoint<
   N extends PropertyKey,
   C extends PropertyKey
 >(
-  step: number,
   config: RunnableConfig,
   channels: Record<string, BaseChannel>,
   streamChannels: string | string[],
   metadata: CheckpointMetadata,
   tasks: readonly PregelExecutableTask<N, C>[],
-  pendingWrites: CheckpointPendingWrite[]
+  pendingWrites: CheckpointPendingWrite[],
+  parentConfig: RunnableConfig | undefined,
+  outputKeys: ChannelKey | ChannelKey[]
 ) {
   function formatConfig(config: RunnableConfig) {
     // https://stackoverflow.com/a/78298178
@@ -199,29 +174,39 @@ export function* mapDebugCheckpoint<
     return pyConfig;
   }
 
-  function getCurrentUTC() {
-    const now = new Date();
-    return new Date(now.getTime() - now.getTimezoneOffset() * 60 * 1000);
+  const parentNs = config.configurable?.checkpoint_ns;
+  const taskStates: Record<string, RunnableConfig | StateSnapshot> = {};
+
+  for (const task of tasks) {
+    const candidates = task.subgraphs?.length ? task.subgraphs : [task.proc];
+    if (!candidates.find(findSubgraphPregel)) continue;
+
+    let taskNs = `${task.name as string}:${task.id}`;
+    if (parentNs) taskNs = `${parentNs}|${taskNs}`;
+
+    taskStates[task.id] = {
+      configurable: {
+        thread_id: config.configurable?.thread_id,
+        checkpoint_ns: taskNs,
+      },
+    };
   }
 
-  const ts = getCurrentUTC().toISOString();
   yield {
-    type: "checkpoint",
-    timestamp: ts,
-    step,
-    payload: {
-      config: formatConfig(config),
-      values: readChannels(channels, streamChannels),
-      metadata,
-      next: tasks.map((task) => task.name),
-      tasks: tasksWithWrites(tasks, pendingWrites),
-    },
+    config: formatConfig(config),
+    values: readChannels(channels, streamChannels),
+    metadata,
+    next: tasks.map((task) => task.name),
+    tasks: tasksWithWrites(tasks, pendingWrites, taskStates, outputKeys),
+    parentConfig: parentConfig ? formatConfig(parentConfig) : undefined,
   };
 }
 
 export function tasksWithWrites<N extends PropertyKey, C extends PropertyKey>(
   tasks: PregelTaskDescription[] | readonly PregelExecutableTask<N, C>[],
-  pendingWrites: CheckpointPendingWrite[]
+  pendingWrites: CheckpointPendingWrite[],
+  states: Record<string, RunnableConfig | StateSnapshot> | undefined,
+  outputKeys: ChannelKey[] | ChannelKey
 ): PregelTaskDescription[] {
   return tasks.map((task): PregelTaskDescription => {
     const error = pendingWrites.find(
@@ -229,24 +214,55 @@ export function tasksWithWrites<N extends PropertyKey, C extends PropertyKey>(
     )?.[2];
 
     const interrupts = pendingWrites
-      .filter(([id, n]) => {
-        return id === task.id && n === INTERRUPT;
-      })
-      .map(([, , v]) => {
-        return v;
-      }) as Interrupt[];
+      .filter(([id, n]) => id === task.id && n === INTERRUPT)
+      .map(([, , v]) => v) as Interrupt[];
+
+    const result = (() => {
+      if (error || interrupts.length || !pendingWrites.length) return undefined;
+
+      const idx = pendingWrites.findIndex(
+        ([tid, n]) => tid === task.id && n === RETURN
+      );
+
+      if (idx >= 0) return pendingWrites[idx][2];
+
+      if (typeof outputKeys === "string") {
+        return pendingWrites.find(
+          ([tid, n]) => tid === task.id && n === outputKeys
+        )?.[2];
+      }
+
+      if (Array.isArray(outputKeys)) {
+        const results = pendingWrites
+          .filter(([tid, n]) => tid === task.id && outputKeys.includes(n))
+          .map(([, n, v]) => [n, v]);
+
+        if (!results.length) return undefined;
+        return Object.fromEntries(results);
+      }
+
+      return undefined;
+    })();
+
     if (error) {
       return {
         id: task.id,
         name: task.name as string,
+        path: task.path,
         error,
         interrupts,
+        result,
       };
     }
+
+    const taskState = states?.[task.id];
     return {
       id: task.id,
       name: task.name as string,
+      path: task.path,
       interrupts,
+      ...(taskState !== undefined ? { state: taskState } : {}),
+      result,
     };
   });
 }

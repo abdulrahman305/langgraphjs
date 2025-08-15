@@ -15,31 +15,63 @@ import {
   type PendingWriteValue,
   uuid5,
   maxChannelVersion,
+  BaseStore,
+  CheckpointPendingWrite,
+  SendProtocol,
 } from "@langchain/langgraph-checkpoint";
 import {
   BaseChannel,
   createCheckpoint,
   emptyChannels,
+  isBaseChannel,
 } from "../channels/base.js";
 import { PregelNode } from "./read.js";
 import { readChannel, readChannels } from "./io.js";
 import {
   _isSend,
   _isSendInterface,
+  CONFIG_KEY_CHECKPOINT_MAP,
   CHECKPOINT_NAMESPACE_SEPARATOR,
   CONFIG_KEY_CHECKPOINTER,
   CONFIG_KEY_READ,
-  CONFIG_KEY_RESUMING,
+  CONFIG_KEY_TASK_ID,
   CONFIG_KEY_SEND,
   INTERRUPT,
   RESERVED,
   Send,
   TAG_HIDDEN,
   TASKS,
+  CHECKPOINT_NAMESPACE_END,
+  PUSH,
+  PULL,
+  RESUME,
+  NULL_TASK_ID,
+  CONFIG_KEY_SCRATCHPAD,
+  RETURN,
+  ERROR,
+  NO_WRITES,
+  CONFIG_KEY_PREVIOUS_STATE,
+  PREVIOUS,
+  CACHE_NS_WRITES,
+  CONFIG_KEY_RESUME_MAP,
 } from "../constants.js";
-import { PregelExecutableTask, PregelTaskDescription } from "./types.js";
+import {
+  Call,
+  isCall,
+  PregelExecutableTask,
+  PregelScratchpad,
+  PregelTaskDescription,
+  SimpleTaskPath,
+  TaskPath,
+  VariadicTaskPath,
+} from "./types.js";
 import { EmptyChannelError, InvalidUpdateError } from "../errors.js";
-import { _getIdMetadata, getNullChannelVersion } from "./utils.js";
+import { getNullChannelVersion } from "./utils/index.js";
+import { LangGraphRunnableConfig } from "./runnable_types.js";
+import { getRunnableForFunc } from "./call.js";
+import { IterableReadableWritableStream } from "./stream.js";
+import { XXH3 } from "../hash.js";
+import { Topic } from "../channels/topic.js";
 
 /**
  * Construct a type with a set of properties K of type T
@@ -52,6 +84,7 @@ export type WritesProtocol<C = string> = {
   name: string;
   writes: PendingWrite<C>[];
   triggers: string[];
+  path?: TaskPath;
 };
 
 export const increment = (current?: number) => {
@@ -89,35 +122,63 @@ export function shouldInterrupt<N extends PropertyKey, C extends PropertyKey>(
   return anyChannelUpdated && anyTriggeredNodeInInterruptNodes;
 }
 
-export function _localRead<Cc extends StrRecord<string, BaseChannel>>(
+export function _localRead<Cc extends Record<string, BaseChannel>>(
   checkpoint: ReadonlyCheckpoint,
   channels: Cc,
   task: WritesProtocol<keyof Cc>,
   select: Array<keyof Cc> | keyof Cc,
   fresh: boolean = false
 ): Record<string, unknown> | unknown {
-  if (fresh) {
-    const newCheckpoint = createCheckpoint(checkpoint, channels, -1);
-    // create a new copy of channels
-    const newChannels = emptyChannels(channels, newCheckpoint);
-    // Note: _applyWrites contains side effects
-    _applyWrites(copyCheckpoint(newCheckpoint), newChannels, [task]);
-    return readChannels(newChannels, select);
+  let updated = new Set<keyof Cc>();
+
+  if (!Array.isArray(select)) {
+    for (const [c] of task.writes) {
+      if (c === select) {
+        updated = new Set([c]);
+        break;
+      }
+    }
+    updated = updated || new Set();
   } else {
-    return readChannels(channels, select);
+    updated = new Set(
+      select.filter((c) => task.writes.some(([key, _]) => key === c))
+    );
   }
+
+  let values: Record<string, unknown>;
+
+  if (fresh && updated.size > 0) {
+    const localChannels = Object.fromEntries(
+      Object.entries(channels).filter(([k, _]) => updated.has(k as keyof Cc))
+    ) as Partial<Cc>;
+
+    const newCheckpoint = createCheckpoint(checkpoint, localChannels as Cc, -1);
+    const newChannels = emptyChannels(localChannels as Cc, newCheckpoint);
+
+    _applyWrites(
+      copyCheckpoint(newCheckpoint),
+      newChannels,
+      [task],
+      undefined,
+      undefined
+    );
+    values = readChannels({ ...channels, ...newChannels }, select);
+  } else {
+    values = readChannels(channels, select);
+  }
+
+  return values;
 }
 
 export function _localWrite(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  commit: (writes: [string, any][]) => void,
+  commit: (writes: [string, any][]) => any,
   processes: Record<string, PregelNode>,
-  channels: Record<string, BaseChannel>,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   writes: [string, any][]
 ) {
   for (const [chan, value] of writes) {
-    if (chan === TASKS) {
+    if ([PUSH, TASKS].includes(chan) && value != null) {
       if (!_isSend(value)) {
         throw new InvalidUpdateError(
           `Invalid packet type, expected SendProtocol, got ${JSON.stringify(
@@ -127,28 +188,59 @@ export function _localWrite(
       }
       if (!(value.node in processes)) {
         throw new InvalidUpdateError(
-          `Invalid node name ${value.node} in packet`
+          `Invalid node name "${value.node}" in Send packet`
         );
       }
-    } else if (!(chan in channels)) {
-      console.warn(`Skipping write for channel '${chan}' which has no readers`);
     }
   }
   commit(writes);
 }
+
+const IGNORE = new Set<string | number | symbol>([
+  NO_WRITES,
+  PUSH,
+  RESUME,
+  INTERRUPT,
+  RETURN,
+  ERROR,
+]);
 
 export function _applyWrites<Cc extends Record<string, BaseChannel>>(
   checkpoint: Checkpoint,
   channels: Cc,
   tasks: WritesProtocol<keyof Cc>[],
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  getNextVersion?: (version: any, channel: BaseChannel) => any
+  getNextVersion: ((version: any) => any) | undefined,
+  triggerToNodes: Record<string, string[]> | undefined
 ): void {
+  // Sort tasks by first 3 path elements for deterministic order
+  // Later path parts (like task IDs) are ignored for sorting
+  tasks.sort((a, b) => {
+    const aPath = a.path?.slice(0, 3) || [];
+    const bPath = b.path?.slice(0, 3) || [];
+
+    // Compare each path element
+    for (let i = 0; i < Math.min(aPath.length, bPath.length); i += 1) {
+      if (aPath[i] < bPath[i]) return -1;
+      if (aPath[i] > bPath[i]) return 1;
+    }
+
+    // If one path is shorter, it comes first
+    return aPath.length - bPath.length;
+  });
+
+  // if no task has triggers this is applying writes from the null task only
+  // so we don't do anything other than update the channels written to
+  const bumpStep = tasks.some((task) => task.triggers.length > 0);
+
+  // Filter out non instances of BaseChannel
+  const onlyChannels = Object.fromEntries(
+    Object.entries(channels).filter(([_, value]) => isBaseChannel(value))
+  ) as Cc;
+
   // Update seen versions
   for (const task of tasks) {
-    if (checkpoint.versions_seen[task.name] === undefined) {
-      checkpoint.versions_seen[task.name] = {};
-    }
+    checkpoint.versions_seen[task.name] ??= {};
     for (const chan of task.triggers) {
       if (chan in checkpoint.channel_versions) {
         checkpoint.versions_seen[task.name][chan] =
@@ -173,44 +265,28 @@ export function _applyWrites<Cc extends Record<string, BaseChannel>>(
   );
 
   for (const chan of channelsToConsume) {
-    if (channels[chan].consume()) {
+    if (chan in onlyChannels && onlyChannels[chan].consume()) {
       if (getNextVersion !== undefined) {
-        checkpoint.channel_versions[chan] = getNextVersion(
-          maxVersion,
-          channels[chan]
-        );
+        checkpoint.channel_versions[chan] = getNextVersion(maxVersion);
       }
     }
-  }
-
-  // Clear pending sends
-  if (checkpoint.pending_sends) {
-    checkpoint.pending_sends = [];
   }
 
   // Group writes by channel
-  const pendingWriteValuesByChannel = {} as Record<
-    keyof Cc,
-    PendingWriteValue[]
-  >;
+  const pendingWritesByChannel = {} as Record<keyof Cc, PendingWriteValue[]>;
   for (const task of tasks) {
     for (const [chan, val] of task.writes) {
-      if (chan === TASKS) {
-        checkpoint.pending_sends.push({
-          node: (val as Send).node,
-          args: (val as Send).args,
-        });
-      } else {
-        if (chan in pendingWriteValuesByChannel) {
-          pendingWriteValuesByChannel[chan].push(val);
-        } else {
-          pendingWriteValuesByChannel[chan] = [val];
-        }
+      if (IGNORE.has(chan)) {
+        // do nothing
+      } else if (chan in onlyChannels) {
+        pendingWritesByChannel[chan] ??= [];
+        pendingWritesByChannel[chan].push(val);
       }
     }
   }
 
-  // find the highest version of all channels
+  // Find the highest version of all channels
+  // TODO: figure out why we need to do this twice (Python only does this once)
   maxVersion = undefined;
   if (Object.keys(checkpoint.channel_versions).length > 0) {
     maxVersion = maxChannelVersion(
@@ -220,42 +296,68 @@ export function _applyWrites<Cc extends Record<string, BaseChannel>>(
 
   const updatedChannels: Set<string> = new Set();
   // Apply writes to channels
-  for (const [chan, vals] of Object.entries(pendingWriteValuesByChannel)) {
-    if (chan in channels) {
+  for (const [chan, vals] of Object.entries(pendingWritesByChannel)) {
+    if (chan in onlyChannels) {
       let updated;
       try {
-        updated = channels[chan].update(vals);
+        updated = onlyChannels[chan].update(vals);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } catch (e: any) {
         if (e.name === InvalidUpdateError.unminifiable_name) {
-          throw new InvalidUpdateError(
-            `Invalid update for channel ${chan} with values ${JSON.stringify(
+          const wrappedError = new InvalidUpdateError(
+            `Invalid update for channel "${chan}" with values ${JSON.stringify(
               vals
             )}: ${e.message}`
           );
+          wrappedError.lc_error_code = e.lc_error_code;
+          throw wrappedError;
         } else {
           throw e;
         }
       }
       if (updated && getNextVersion !== undefined) {
-        checkpoint.channel_versions[chan] = getNextVersion(
-          maxVersion,
-          channels[chan]
-        );
+        checkpoint.channel_versions[chan] = getNextVersion(maxVersion);
+
+        // unavailable channels can't trigger tasks, so don't add them
+        if (onlyChannels[chan].isAvailable()) {
+          updatedChannels.add(chan);
+        }
       }
-      updatedChannels.add(chan);
     }
   }
 
   // Channels that weren't updated in this step are notified of a new step
-  for (const chan of Object.keys(channels)) {
-    if (!updatedChannels.has(chan)) {
-      const updated = channels[chan].update([]);
-      if (updated && getNextVersion !== undefined) {
-        checkpoint.channel_versions[chan] = getNextVersion(
-          maxVersion,
-          channels[chan]
-        );
+  if (bumpStep) {
+    for (const chan of Object.keys(onlyChannels)) {
+      if (onlyChannels[chan].isAvailable() && !updatedChannels.has(chan)) {
+        const updated = onlyChannels[chan].update([]);
+        if (updated && getNextVersion !== undefined) {
+          checkpoint.channel_versions[chan] = getNextVersion(maxVersion);
+
+          // unavailable channels can't trigger tasks, so don't add them
+          if (onlyChannels[chan].isAvailable()) {
+            updatedChannels.add(chan);
+          }
+        }
+      }
+    }
+  }
+
+  // If this is (tentatively) the last superstep, notify all channels of finish
+  if (
+    bumpStep &&
+    !Object.keys(triggerToNodes ?? {}).some((channel) =>
+      updatedChannels.has(channel)
+    )
+  ) {
+    for (const chan of Object.keys(onlyChannels)) {
+      if (onlyChannels[chan].finish() && getNextVersion !== undefined) {
+        checkpoint.channel_versions[chan] = getNextVersion(maxVersion);
+
+        // unavailable channels can't trigger tasks, so don't add them
+        if (onlyChannels[chan].isAvailable()) {
+          updatedChannels.add(chan);
+        }
       }
     }
   }
@@ -266,6 +368,16 @@ export type NextTaskExtraFields = {
   isResuming?: boolean;
   checkpointer?: BaseCheckpointSaver;
   manager?: CallbackManagerForChainRun;
+  store?: BaseStore;
+  stream?: IterableReadableWritableStream;
+};
+
+export type NextTaskExtraFieldsWithStore = NextTaskExtraFields & {
+  store?: BaseStore;
+};
+
+export type NextTaskExtraFieldsWithoutStore = NextTaskExtraFields & {
+  store?: never;
 };
 
 export function _prepareNextTasks<
@@ -273,132 +385,463 @@ export function _prepareNextTasks<
   Cc extends StrRecord<string, BaseChannel>
 >(
   checkpoint: ReadonlyCheckpoint,
+  pendingWrites: [string, string, unknown][] | undefined,
   processes: Nn,
   channels: Cc,
   config: RunnableConfig,
   forExecution: false,
-  extra: NextTaskExtraFields
-): PregelTaskDescription[];
+  extra: NextTaskExtraFieldsWithoutStore
+): Record<string, PregelTaskDescription>;
 
 export function _prepareNextTasks<
   Nn extends StrRecord<string, PregelNode>,
   Cc extends StrRecord<string, BaseChannel>
 >(
   checkpoint: ReadonlyCheckpoint,
+  pendingWrites: [string, string, unknown][] | undefined,
   processes: Nn,
   channels: Cc,
   config: RunnableConfig,
   forExecution: true,
-  extra: NextTaskExtraFields
-): PregelExecutableTask<keyof Nn, keyof Cc>[];
+  extra: NextTaskExtraFieldsWithStore
+): Record<string, PregelExecutableTask<keyof Nn, keyof Cc>>;
 
+/**
+ * Prepare the set of tasks that will make up the next Pregel step.
+ * This is the union of all PUSH tasks (Sends) and PULL tasks (nodes triggered
+ * by edges).
+ */
 export function _prepareNextTasks<
   Nn extends StrRecord<string, PregelNode>,
   Cc extends StrRecord<string, BaseChannel>
 >(
   checkpoint: ReadonlyCheckpoint,
+  pendingWrites: [string, string, unknown][] | undefined,
   processes: Nn,
   channels: Cc,
   config: RunnableConfig,
   forExecution: boolean,
-  extra: NextTaskExtraFields
-): PregelTaskDescription[] | PregelExecutableTask<keyof Nn, keyof Cc>[] {
-  const parentNamespace = config.configurable?.checkpoint_ns ?? "";
-  const tasks: Array<PregelExecutableTask<keyof Nn, keyof Cc>> = [];
-  const taskDescriptions: Array<PregelTaskDescription> = [];
-  const { step, isResuming = false, checkpointer, manager } = extra;
+  extra: NextTaskExtraFieldsWithStore | NextTaskExtraFieldsWithoutStore
+):
+  | Record<string, PregelTaskDescription>
+  | Record<string, PregelExecutableTask<keyof Nn, keyof Cc>> {
+  const tasks:
+    | Record<string, PregelExecutableTask<keyof Nn, keyof Cc>>
+    | Record<string, PregelTaskDescription> = {};
 
-  for (const packet of checkpoint.pending_sends) {
-    if (!_isSendInterface(packet)) {
-      console.warn(
-        `Ignoring invalid packet ${JSON.stringify(packet)} in pending sends.`
-      );
-      continue;
-    }
-    if (!(packet.node in processes)) {
-      console.warn(
-        `Ignoring unknown node name ${packet.node} in pending sends.`
-      );
-      continue;
-    }
-    const triggers = [TASKS];
-    const metadata = _getIdMetadata({
-      langgraph_step: step,
-      langgraph_node: packet.node,
-      langgraph_triggers: triggers,
-      langgraph_task_idx: forExecution ? tasks.length : taskDescriptions.length,
-    });
-    const checkpointNamespace =
-      parentNamespace === ""
-        ? packet.node
-        : `${parentNamespace}${CHECKPOINT_NAMESPACE_SEPARATOR}${packet.node}`;
-    const taskId = uuid5(
-      JSON.stringify([checkpointNamespace, metadata]),
-      checkpoint.id
-    );
+  // Consume pending tasks
+  const tasksChannel = channels[TASKS] as Topic<SendProtocol> | undefined;
 
-    if (forExecution) {
-      const proc = processes[packet.node];
-      const node = proc.getNode();
-      if (node !== undefined) {
-        const writes: [keyof Cc, unknown][] = [];
-        tasks.push({
-          name: packet.node,
-          input: packet.args,
-          proc: node,
-          writes,
-          triggers,
-          config: patchConfig(
-            mergeConfigs(config, processes[packet.node].config, {
-              metadata,
-            }),
-            {
-              runName: packet.node,
-              callbacks: manager?.getChild(`graph:step:${step}`),
-              configurable: {
-                [CONFIG_KEY_SEND]: _localWrite.bind(
-                  undefined,
-                  (items: [keyof Cc, unknown][]) => writes.push(...items),
-                  processes,
-                  channels
-                ),
-                [CONFIG_KEY_READ]: _localRead.bind(
-                  undefined,
-                  checkpoint,
-                  channels,
-                  {
-                    name: packet.node,
-                    writes: writes as Array<[string, unknown]>,
-                    triggers,
-                  }
-                ),
-              },
-            }
-          ),
-          id: taskId,
-          retry_policy: proc.retryPolicy,
-        });
+  if (tasksChannel?.isAvailable()) {
+    const len = tasksChannel.get().length;
+    for (let i = 0; i < len; i += 1) {
+      const task = _prepareSingleTask(
+        [PUSH, i],
+        checkpoint,
+        pendingWrites,
+        processes,
+        channels,
+        config,
+        forExecution,
+        extra
+      );
+      if (task !== undefined) {
+        tasks[task.id] = task;
       }
-    } else {
-      taskDescriptions.push({ id: taskId, name: packet.node, interrupts: [] });
     }
   }
 
   // Check if any processes should be run in next step
   // If so, prepare the values to be passed to them
-  const nullVersion = getNullChannelVersion(checkpoint.channel_versions);
-  if (nullVersion === undefined) {
-    return forExecution ? tasks : taskDescriptions;
+  for (const name of Object.keys(processes)) {
+    const task = _prepareSingleTask(
+      [PULL, name],
+      checkpoint,
+      pendingWrites,
+      processes,
+      channels,
+      config,
+      forExecution,
+      extra
+    );
+    if (task !== undefined) {
+      tasks[task.id] = task;
+    }
   }
-  for (const [name, proc] of Object.entries<PregelNode>(processes)) {
+  return tasks;
+}
+
+export function _prepareSingleTask<
+  Nn extends StrRecord<string, PregelNode>,
+  Cc extends StrRecord<string, BaseChannel>
+>(
+  taskPath: SimpleTaskPath,
+  checkpoint: ReadonlyCheckpoint,
+  pendingWrites: CheckpointPendingWrite[] | undefined,
+  processes: Nn,
+  channels: Cc,
+  config: RunnableConfig,
+  forExecution: false,
+  extra: NextTaskExtraFields
+): PregelTaskDescription | undefined;
+
+export function _prepareSingleTask<
+  Nn extends StrRecord<string, PregelNode>,
+  Cc extends StrRecord<string, BaseChannel>
+>(
+  taskPath: TaskPath,
+  checkpoint: ReadonlyCheckpoint,
+  pendingWrites: CheckpointPendingWrite[] | undefined,
+  processes: Nn,
+  channels: Cc,
+  config: RunnableConfig,
+  forExecution: true,
+  extra: NextTaskExtraFields
+): PregelExecutableTask<keyof Nn, keyof Cc> | undefined;
+
+export function _prepareSingleTask<
+  Nn extends StrRecord<string, PregelNode>,
+  Cc extends StrRecord<string, BaseChannel>
+>(
+  taskPath: TaskPath,
+  checkpoint: ReadonlyCheckpoint,
+  pendingWrites: CheckpointPendingWrite[] | undefined,
+  processes: Nn,
+  channels: Cc,
+  config: RunnableConfig,
+  forExecution: boolean,
+  extra: NextTaskExtraFieldsWithStore
+): PregelTaskDescription | PregelExecutableTask<keyof Nn, keyof Cc> | undefined;
+
+/**
+ * Prepares a single task for the next Pregel step, given a task path, which
+ * uniquely identifies a PUSH or PULL task within the graph.
+ */
+export function _prepareSingleTask<
+  Nn extends StrRecord<string, PregelNode>,
+  Cc extends StrRecord<string, BaseChannel>
+>(
+  taskPath: TaskPath,
+  checkpoint: ReadonlyCheckpoint,
+  pendingWrites: CheckpointPendingWrite[] | undefined,
+  processes: Nn,
+  channels: Cc,
+  config: LangGraphRunnableConfig,
+  forExecution: boolean,
+  extra: NextTaskExtraFields
+):
+  | PregelTaskDescription
+  | PregelExecutableTask<keyof Nn, keyof Cc>
+  | undefined {
+  const { step, checkpointer, manager } = extra;
+  const configurable = config.configurable ?? {};
+  const parentNamespace = configurable.checkpoint_ns ?? "";
+
+  if (taskPath[0] === PUSH && isCall(taskPath[taskPath.length - 1])) {
+    const call = taskPath[taskPath.length - 1] as Call;
+    const proc = getRunnableForFunc(call.name, call.func);
+    const triggers = [PUSH];
+    const checkpointNamespace =
+      parentNamespace === ""
+        ? call.name
+        : `${parentNamespace}${CHECKPOINT_NAMESPACE_SEPARATOR}${call.name}`;
+    const id = uuid5(
+      JSON.stringify([
+        checkpointNamespace,
+        step.toString(),
+        call.name,
+        PUSH,
+        taskPath[1],
+        taskPath[2],
+      ]),
+      checkpoint.id
+    );
+    const taskCheckpointNamespace = `${checkpointNamespace}${CHECKPOINT_NAMESPACE_END}${id}`;
+
+    // we append `true` to the task path to indicate that a call is being made
+    // so we should not return interrupts from this task (responsibility lies with the parent)
+    const outputTaskPath = [...taskPath.slice(0, 3), true] as VariadicTaskPath;
+    const metadata = {
+      langgraph_step: step,
+      langgraph_node: call.name,
+      langgraph_triggers: triggers,
+      langgraph_path: outputTaskPath,
+      langgraph_checkpoint_ns: taskCheckpointNamespace,
+    };
+    if (forExecution) {
+      const writes: [keyof Cc, unknown][] = [];
+      const task = {
+        name: call.name,
+        input: call.input,
+        proc,
+        writes,
+        config: patchConfig(
+          mergeConfigs(config, {
+            metadata,
+            store: extra.store ?? config.store,
+          }),
+          {
+            runName: call.name,
+            callbacks: manager?.getChild(`graph:step:${step}`),
+            configurable: {
+              [CONFIG_KEY_TASK_ID]: id,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              [CONFIG_KEY_SEND]: (writes_: PendingWrite[]) =>
+                _localWrite(
+                  (items: PendingWrite<keyof Cc>[]) => writes.push(...items),
+                  processes,
+                  writes_
+                ),
+              [CONFIG_KEY_READ]: (
+                select_: Array<keyof Cc> | keyof Cc,
+                fresh_: boolean = false
+              ) =>
+                _localRead(
+                  checkpoint,
+                  channels,
+                  {
+                    name: call.name,
+                    writes: writes as PendingWrite[],
+                    triggers,
+                    path: outputTaskPath,
+                  },
+                  select_,
+                  fresh_
+                ),
+              [CONFIG_KEY_CHECKPOINTER]:
+                checkpointer ?? configurable[CONFIG_KEY_CHECKPOINTER],
+              [CONFIG_KEY_CHECKPOINT_MAP]: {
+                ...configurable[CONFIG_KEY_CHECKPOINT_MAP],
+                [parentNamespace]: checkpoint.id,
+              },
+              [CONFIG_KEY_SCRATCHPAD]: _scratchpad({
+                pendingWrites: pendingWrites ?? [],
+                taskId: id,
+                currentTaskInput: call.input,
+                resumeMap: config.configurable?.[CONFIG_KEY_RESUME_MAP],
+                namespaceHash: XXH3(taskCheckpointNamespace),
+              }),
+              [CONFIG_KEY_PREVIOUS_STATE]: checkpoint.channel_values[PREVIOUS],
+              checkpoint_id: undefined,
+              checkpoint_ns: taskCheckpointNamespace,
+            },
+          }
+        ),
+        triggers,
+        retry_policy: call.retry,
+        cache_key: call.cache
+          ? {
+              key: XXH3((call.cache.keyFunc ?? JSON.stringify)([call.input])),
+              ns: [CACHE_NS_WRITES, call.name ?? "__dynamic__"],
+              ttl: call.cache.ttl,
+            }
+          : undefined,
+        id,
+        path: outputTaskPath,
+        writers: [],
+      } satisfies PregelExecutableTask<keyof Nn, keyof Cc>;
+      return task;
+    } else {
+      return {
+        id,
+        name: call.name,
+        interrupts: [],
+        path: outputTaskPath,
+      };
+    }
+  } else if (taskPath[0] === PUSH) {
+    const index =
+      typeof taskPath[1] === "number"
+        ? taskPath[1]
+        : parseInt(taskPath[1] as string, 10);
+
+    if (!channels[TASKS]?.isAvailable()) {
+      return undefined;
+    }
+
+    const sends = channels[TASKS].get() as SendProtocol[];
+    if (index < 0 || index >= sends.length) {
+      return undefined;
+    }
+
+    const packet =
+      _isSendInterface(sends[index]) && !_isSend(sends[index])
+        ? new Send(sends[index].node, sends[index].args)
+        : sends[index];
+
+    if (!_isSendInterface(packet)) {
+      console.warn(
+        `Ignoring invalid packet ${JSON.stringify(packet)} in pending sends.`
+      );
+      return undefined;
+    }
+    if (!(packet.node in processes)) {
+      console.warn(
+        `Ignoring unknown node name ${packet.node} in pending sends.`
+      );
+      return undefined;
+    }
+    const triggers = [PUSH];
+    const checkpointNamespace =
+      parentNamespace === ""
+        ? packet.node
+        : `${parentNamespace}${CHECKPOINT_NAMESPACE_SEPARATOR}${packet.node}`;
+    const taskId = uuid5(
+      JSON.stringify([
+        checkpointNamespace,
+        step.toString(),
+        packet.node,
+        PUSH,
+        index.toString(),
+      ]),
+      checkpoint.id
+    );
+    const taskCheckpointNamespace = `${checkpointNamespace}${CHECKPOINT_NAMESPACE_END}${taskId}`;
+    let metadata = {
+      langgraph_step: step,
+      langgraph_node: packet.node,
+      langgraph_triggers: triggers,
+      langgraph_path: taskPath.slice(0, 3),
+      langgraph_checkpoint_ns: taskCheckpointNamespace,
+    };
+    if (forExecution) {
+      const proc = processes[packet.node];
+      const node = proc.getNode();
+      if (node !== undefined) {
+        if (proc.metadata !== undefined) {
+          metadata = { ...metadata, ...proc.metadata };
+        }
+        const writes: [keyof Cc, unknown][] = [];
+        return {
+          name: packet.node,
+          input: packet.args,
+          proc: node,
+          subgraphs: proc.subgraphs,
+          writes,
+          config: patchConfig(
+            mergeConfigs(config, {
+              metadata,
+              tags: proc.tags,
+              store: extra.store ?? config.store,
+            }),
+            {
+              runName: packet.node,
+              callbacks: manager?.getChild(`graph:step:${step}`),
+              configurable: {
+                [CONFIG_KEY_TASK_ID]: taskId,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                [CONFIG_KEY_SEND]: (writes_: PendingWrite[]) =>
+                  _localWrite(
+                    (items: PendingWrite<keyof Cc>[]) => writes.push(...items),
+                    processes,
+                    writes_
+                  ),
+                [CONFIG_KEY_READ]: (
+                  select_: Array<keyof Cc> | keyof Cc,
+                  fresh_: boolean = false
+                ) =>
+                  _localRead(
+                    checkpoint,
+                    channels,
+                    {
+                      name: packet.node,
+                      writes: writes as PendingWrite[],
+                      triggers,
+                      path: taskPath,
+                    },
+                    select_,
+                    fresh_
+                  ),
+                [CONFIG_KEY_CHECKPOINTER]:
+                  checkpointer ?? configurable[CONFIG_KEY_CHECKPOINTER],
+                [CONFIG_KEY_CHECKPOINT_MAP]: {
+                  ...configurable[CONFIG_KEY_CHECKPOINT_MAP],
+                  [parentNamespace]: checkpoint.id,
+                },
+                [CONFIG_KEY_SCRATCHPAD]: _scratchpad({
+                  pendingWrites: pendingWrites ?? [],
+                  taskId,
+                  currentTaskInput: packet.args,
+                  resumeMap: config.configurable?.[CONFIG_KEY_RESUME_MAP],
+                  namespaceHash: XXH3(taskCheckpointNamespace),
+                }),
+                [CONFIG_KEY_PREVIOUS_STATE]:
+                  checkpoint.channel_values[PREVIOUS],
+                checkpoint_id: undefined,
+                checkpoint_ns: taskCheckpointNamespace,
+              },
+            }
+          ),
+          triggers,
+          retry_policy: proc.retryPolicy,
+          cache_key: proc.cachePolicy
+            ? {
+                key: XXH3(
+                  (proc.cachePolicy.keyFunc ?? JSON.stringify)([packet.args])
+                ),
+                ns: [CACHE_NS_WRITES, proc.name ?? "__dynamic__", packet.node],
+                ttl: proc.cachePolicy.ttl,
+              }
+            : undefined,
+          id: taskId,
+          path: taskPath,
+          writers: proc.getWriters(),
+        } satisfies PregelExecutableTask<keyof Nn, keyof Cc>;
+      }
+    } else {
+      return {
+        id: taskId,
+        name: packet.node,
+        interrupts: [],
+        path: taskPath,
+      } satisfies PregelTaskDescription;
+    }
+  } else if (taskPath[0] === PULL) {
+    const name = taskPath[1].toString();
+    const proc = processes[name];
+    if (proc === undefined) {
+      return undefined;
+    }
+
+    // Check if this task already has successful writes in the pending writes
+    if (pendingWrites?.length) {
+      // Find the task ID for this node/path
+      const checkpointNamespace =
+        parentNamespace === ""
+          ? name
+          : `${parentNamespace}${CHECKPOINT_NAMESPACE_SEPARATOR}${name}`;
+
+      const taskId = uuid5(
+        JSON.stringify([
+          checkpointNamespace,
+          step.toString(),
+          name,
+          PULL,
+          name,
+        ]),
+        checkpoint.id
+      );
+
+      // Check if there are successful writes (not ERROR) for this task ID
+      const hasSuccessfulWrites = pendingWrites.some(
+        (w) => w[0] === taskId && w[1] !== ERROR
+      );
+
+      // If task completed successfully, don't include it in next tasks
+      if (hasSuccessfulWrites) {
+        return undefined;
+      }
+    }
+
+    const nullVersion = getNullChannelVersion(checkpoint.channel_versions);
+    if (nullVersion === undefined) {
+      return undefined;
+    }
     const seen = checkpoint.versions_seen[name] ?? {};
     const triggers = proc.triggers
       .filter((chan) => {
-        const result = readChannel(channels, chan, false, true);
-        const isEmptyChannelError =
-          // eslint-disable-next-line no-instanceof/no-instanceof
-          result instanceof Error &&
-          result.name === EmptyChannelError.unminifiable_name;
+        // here we're only checking if the channel is not empty
+        const isEmptyChannelError = !channels[chan].isAvailable();
         return (
           !isEmptyChannelError &&
           (checkpoint.channel_versions[chan] ?? nullVersion) >
@@ -410,79 +853,135 @@ export function _prepareNextTasks<
     if (triggers.length > 0) {
       const val = _procInput(proc, channels, forExecution);
       if (val === undefined) {
-        continue;
+        return undefined;
       }
-
-      const metadata = _getIdMetadata({
-        langgraph_step: step,
-        langgraph_node: name,
-        langgraph_triggers: triggers,
-        langgraph_task_idx: forExecution
-          ? tasks.length
-          : taskDescriptions.length,
-      });
-
       const checkpointNamespace =
         parentNamespace === ""
           ? name
           : `${parentNamespace}${CHECKPOINT_NAMESPACE_SEPARATOR}${name}`;
-
       const taskId = uuid5(
-        JSON.stringify([checkpointNamespace, metadata]),
+        JSON.stringify([
+          checkpointNamespace,
+          step.toString(),
+          name,
+          PULL,
+          triggers,
+        ]),
         checkpoint.id
       );
-
+      const taskCheckpointNamespace = `${checkpointNamespace}${CHECKPOINT_NAMESPACE_END}${taskId}`;
+      let metadata = {
+        langgraph_step: step,
+        langgraph_node: name,
+        langgraph_triggers: triggers,
+        langgraph_path: taskPath,
+        langgraph_checkpoint_ns: taskCheckpointNamespace,
+      };
       if (forExecution) {
         const node = proc.getNode();
         if (node !== undefined) {
+          if (proc.metadata !== undefined) {
+            metadata = { ...metadata, ...proc.metadata };
+          }
           const writes: [keyof Cc, unknown][] = [];
-          tasks.push({
+          return {
             name,
             input: val,
             proc: node,
+            subgraphs: proc.subgraphs,
             writes,
-            triggers,
             config: patchConfig(
-              mergeConfigs(config, proc.config, { metadata }),
+              mergeConfigs(config, {
+                metadata,
+                tags: proc.tags,
+                store: extra.store ?? config.store,
+              }),
               {
                 runName: name,
                 callbacks: manager?.getChild(`graph:step:${step}`),
                 configurable: {
-                  [CONFIG_KEY_SEND]: _localWrite.bind(
-                    undefined,
-                    (items: [keyof Cc, unknown][]) => writes.push(...items),
-                    processes,
-                    channels
-                  ),
-                  [CONFIG_KEY_READ]: _localRead.bind(
-                    undefined,
-                    checkpoint,
-                    channels,
-                    {
-                      name,
-                      writes: writes as Array<[string, unknown]>,
-                      triggers,
-                    }
-                  ),
-                  [CONFIG_KEY_CHECKPOINTER]: checkpointer,
-                  [CONFIG_KEY_RESUMING]: isResuming,
-                  checkpoint_id: checkpoint.id,
-                  checkpoint_ns: checkpointNamespace,
+                  [CONFIG_KEY_TASK_ID]: taskId,
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  [CONFIG_KEY_SEND]: (writes_: PendingWrite[]) =>
+                    _localWrite(
+                      (items: PendingWrite<keyof Cc>[]) => {
+                        writes.push(...items);
+                      },
+                      processes,
+                      writes_
+                    ),
+                  [CONFIG_KEY_READ]: (
+                    select_: Array<keyof Cc> | keyof Cc,
+                    fresh_: boolean = false
+                  ) =>
+                    _localRead(
+                      checkpoint,
+                      channels,
+                      {
+                        name,
+                        writes: writes as PendingWrite[],
+                        triggers,
+                        path: taskPath,
+                      },
+                      select_,
+                      fresh_
+                    ),
+                  [CONFIG_KEY_CHECKPOINTER]:
+                    checkpointer ?? configurable[CONFIG_KEY_CHECKPOINTER],
+                  [CONFIG_KEY_CHECKPOINT_MAP]: {
+                    ...configurable[CONFIG_KEY_CHECKPOINT_MAP],
+                    [parentNamespace]: checkpoint.id,
+                  },
+                  [CONFIG_KEY_SCRATCHPAD]: _scratchpad({
+                    pendingWrites: pendingWrites ?? [],
+                    taskId,
+                    currentTaskInput: val,
+                    resumeMap: config.configurable?.[CONFIG_KEY_RESUME_MAP],
+                    namespaceHash: XXH3(taskCheckpointNamespace),
+                  }),
+                  [CONFIG_KEY_PREVIOUS_STATE]:
+                    checkpoint.channel_values[PREVIOUS],
+                  checkpoint_id: undefined,
+                  checkpoint_ns: taskCheckpointNamespace,
                 },
               }
             ),
-            id: taskId,
+            triggers,
             retry_policy: proc.retryPolicy,
-          });
+            cache_key: proc.cachePolicy
+              ? {
+                  key: XXH3(
+                    (proc.cachePolicy.keyFunc ?? JSON.stringify)([val])
+                  ),
+                  ns: [CACHE_NS_WRITES, proc.name ?? "__dynamic__", name],
+                  ttl: proc.cachePolicy.ttl,
+                }
+              : undefined,
+            id: taskId,
+            path: taskPath,
+            writers: proc.getWriters(),
+          } satisfies PregelExecutableTask<keyof Nn, keyof Cc>;
         }
       } else {
-        taskDescriptions.push({ id: taskId, name, interrupts: [] });
+        return {
+          id: taskId,
+          name,
+          interrupts: [],
+          path: taskPath,
+        } satisfies PregelTaskDescription;
       }
     }
   }
-  return forExecution ? tasks : taskDescriptions;
+  return undefined;
 }
 
+/**
+ *  Function injected under CONFIG_KEY_READ in task config, to read current state.
+ *  Used by conditional edges to read a copy of the state with reflecting the writes
+ *  from that node only.
+ *
+ * @internal
+ */
 function _procInput(
   proc: PregelNode,
   channels: StrRecord<string, BaseChannel>,
@@ -490,9 +989,35 @@ function _procInput(
 ) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let val: any;
-  // If all trigger channels subscribed by this process are not empty
-  // then invoke the process with the values of all non-empty channels
-  if (Array.isArray(proc.channels)) {
+
+  if (typeof proc.channels === "object" && !Array.isArray(proc.channels)) {
+    val = {};
+    for (const [k, chan] of Object.entries(proc.channels)) {
+      if (proc.triggers.includes(chan)) {
+        try {
+          val[k] = readChannel(channels, chan, false);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } catch (e: any) {
+          if (e.name === EmptyChannelError.unminifiable_name) {
+            return undefined;
+          } else {
+            throw e;
+          }
+        }
+      } else if (chan in channels) {
+        try {
+          val[k] = readChannel(channels, chan, false);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } catch (e: any) {
+          if (e.name === EmptyChannelError.unminifiable_name) {
+            continue;
+          } else {
+            throw e;
+          }
+        }
+      }
+    }
+  } else if (Array.isArray(proc.channels)) {
     let successfulRead = false;
     for (const chan of proc.channels) {
       try {
@@ -509,21 +1034,7 @@ function _procInput(
       }
     }
     if (!successfulRead) {
-      return;
-    }
-  } else if (typeof proc.channels === "object") {
-    val = {};
-    for (const [k, chan] of Object.entries(proc.channels)) {
-      try {
-        val[k] = readChannel(channels, chan, !proc.triggers.includes(chan));
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } catch (e: any) {
-        if (e.name === EmptyChannelError.unminifiable_name) {
-          continue;
-        } else {
-          throw e;
-        }
-      }
+      return undefined;
     }
   } else {
     throw new Error(
@@ -537,4 +1048,62 @@ function _procInput(
   }
 
   return val;
+}
+
+function _scratchpad({
+  pendingWrites,
+  taskId,
+  currentTaskInput,
+  resumeMap,
+  namespaceHash,
+}: {
+  pendingWrites: CheckpointPendingWrite[];
+  taskId: string;
+  currentTaskInput: unknown;
+  resumeMap: Record<string, unknown> | undefined;
+  namespaceHash: string;
+}): PregelScratchpad {
+  const nullResume = pendingWrites.find(
+    ([writeTaskId, chan]) => writeTaskId === NULL_TASK_ID && chan === RESUME
+  )?.[2];
+
+  const resume = (() => {
+    const result = pendingWrites
+      .filter(
+        ([writeTaskId, chan]) => writeTaskId === taskId && chan === RESUME
+      )
+      .flatMap(([_writeTaskId, _chan, resume]) => resume);
+
+    if (resumeMap != null && namespaceHash in resumeMap) {
+      const mappedResume = resumeMap[namespaceHash];
+      result.push(mappedResume);
+    }
+
+    return result;
+  })();
+
+  const scratchpad = {
+    callCounter: 0,
+    interruptCounter: -1,
+    resume,
+    nullResume,
+    subgraphCounter: 0,
+    currentTaskInput,
+    consumeNullResume: () => {
+      if (scratchpad.nullResume) {
+        delete scratchpad.nullResume;
+        pendingWrites.splice(
+          pendingWrites.findIndex(
+            ([writeTaskId, chan]) =>
+              writeTaskId === NULL_TASK_ID && chan === RESUME
+          ),
+          1
+        );
+        return nullResume;
+      }
+
+      return undefined;
+    },
+  };
+  return scratchpad;
 }

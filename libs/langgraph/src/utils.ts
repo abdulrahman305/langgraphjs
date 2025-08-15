@@ -6,6 +6,7 @@ import {
   RunnableConfig,
 } from "@langchain/core/runnables";
 import { AsyncLocalStorageProviderSingleton } from "@langchain/core/singletons";
+import { ensureLangGraphConfig } from "./pregel/utils/config.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export interface RunnableCallableArgs extends Partial<any> {
@@ -65,25 +66,33 @@ export class RunnableCallable<I = unknown, O = unknown> extends Runnable<I, O> {
 
   async invoke(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    input: any,
+    input: I,
     options?: Partial<RunnableConfig> | undefined
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ): Promise<any> {
+  ): Promise<O> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let returnValue: any;
+    const config = ensureLangGraphConfig(options);
+    const mergedConfig = mergeConfigs(this.config, config);
 
     if (this.trace) {
       returnValue = await this._callWithConfig(
         this._tracedInvoke,
         input,
-        mergeConfigs(this.config, options)
+        mergedConfig
       );
     } else {
-      returnValue = await this.func(input, mergeConfigs(this.config, options));
+      returnValue = await AsyncLocalStorageProviderSingleton.runWithConfig(
+        mergedConfig,
+        async () => this.func(input, mergedConfig)
+      );
     }
 
     if (Runnable.isRunnable(returnValue) && this.recurse) {
-      return await returnValue.invoke(input, options);
+      return await AsyncLocalStorageProviderSingleton.runWithConfig(
+        mergedConfig,
+        async () => returnValue.invoke(input, mergedConfig)
+      );
     }
 
     return returnValue;
@@ -94,10 +103,12 @@ export function prefixGenerator<T, Prefix extends string>(
   generator: Generator<T>,
   prefix: Prefix
 ): Generator<[Prefix, T]>;
+
 export function prefixGenerator<T>(
   generator: Generator<T>,
   prefix?: undefined
 ): Generator<T>;
+
 export function prefixGenerator<
   T,
   Prefix extends string | undefined = undefined
@@ -142,4 +153,49 @@ export function gatherIteratorSync<T>(i: Iterable<T>): Array<T> {
     out.push(item);
   }
   return out;
+}
+
+export function patchConfigurable(
+  config: RunnableConfig | undefined,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  patch: Record<string, any>
+): RunnableConfig {
+  if (!config) {
+    return {
+      configurable: patch,
+    };
+  } else if (!("configurable" in config)) {
+    return {
+      ...config,
+      configurable: patch,
+    };
+  } else {
+    return {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        ...patch,
+      },
+    };
+  }
+}
+
+export function isAsyncGeneratorFunction(
+  val: unknown
+): val is AsyncGeneratorFunction {
+  return (
+    val != null &&
+    typeof val === "function" &&
+    // eslint-disable-next-line no-instanceof/no-instanceof
+    val instanceof Object.getPrototypeOf(async function* () {}).constructor
+  );
+}
+
+export function isGeneratorFunction(val: unknown): val is GeneratorFunction {
+  return (
+    val != null &&
+    typeof val === "function" &&
+    // eslint-disable-next-line no-instanceof/no-instanceof
+    val instanceof Object.getPrototypeOf(function* () {}).constructor
+  );
 }

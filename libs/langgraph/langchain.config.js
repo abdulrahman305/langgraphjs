@@ -10,12 +10,15 @@ function abs(relativePath) {
 }
 
 export const config = {
-  internals: [/node\:/, /@langchain\/core\//, /async_hooks/],
+  internals: [/node\:/, /@langchain\/core\//, /async_hooks/, /zod\/v[34]/],
   entrypoints: {
     index: "index",
     web: "web",
     pregel: "pregel/index",
-    prebuilt: "prebuilt/index"
+    prebuilt: "prebuilt/index",
+    remote: "remote",
+    zod: "graph/zod/index",
+    "zod/schema": "graph/zod/schema",
   },
   tsConfigPath: resolve("./tsconfig.json"),
   cjsSource: "./dist-cjs",

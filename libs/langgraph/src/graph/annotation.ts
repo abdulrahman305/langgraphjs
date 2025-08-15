@@ -1,4 +1,4 @@
-import { RunnableLike } from "@langchain/core/runnables";
+import { RunnableLike } from "../pregel/runnable_types.js";
 import { BaseChannel } from "../channels/base.js";
 import { BinaryOperator, BinaryOperatorAggregate } from "../channels/binop.js";
 import { LastValue } from "../channels/last_value.js";
@@ -43,7 +43,7 @@ export type UpdateType<SD extends StateDefinition> = {
 
 export type NodeType<SD extends StateDefinition> = RunnableLike<
   StateType<SD>,
-  UpdateType<SD>
+  UpdateType<SD> | Partial<StateType<SD>>
 >;
 
 /** @ignore */
@@ -57,7 +57,6 @@ export interface AnnotationFunction {
 
 /**
  * Should not be instantiated directly. See {@link Annotation}.
- * @internal
  */
 export class AnnotationRoot<SD extends StateDefinition> {
   lc_graph_name = "AnnotationRoot";
