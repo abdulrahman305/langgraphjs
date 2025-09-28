@@ -321,6 +321,7 @@ export class FileSystemAssistants implements AssistantsRepo {
       metadata?: Metadata;
       if_exists: OnConflictBehavior;
       name?: string;
+      description?: string;
     },
     auth: AuthContext | undefined
   ): Promise<Assistant> {
@@ -335,6 +336,7 @@ export class FileSystemAssistants implements AssistantsRepo {
         metadata: options.metadata,
         if_exists: options.if_exists,
         name: options.name,
+        description: options.description,
       }
     );
 
@@ -365,6 +367,7 @@ export class FileSystemAssistants implements AssistantsRepo {
         graph_id: options.graph_id,
         metadata: mutable.metadata ?? ({} as Metadata),
         name: options.name || options.graph_id,
+        description: options.description,
       };
 
       STORE.assistant_versions.push({
@@ -376,6 +379,7 @@ export class FileSystemAssistants implements AssistantsRepo {
         metadata: mutable.metadata ?? ({} as Metadata),
         created_at: now,
         name: options.name || options.graph_id,
+        description: options.description,
       });
 
       return STORE.assistants[assistant_id];
@@ -390,6 +394,7 @@ export class FileSystemAssistants implements AssistantsRepo {
       graph_id?: string;
       metadata?: Metadata;
       name?: string;
+      description?: string;
     },
     auth: AuthContext | undefined
   ): Promise<Assistant> {
@@ -402,6 +407,7 @@ export class FileSystemAssistants implements AssistantsRepo {
         config: options?.config,
         metadata: options?.metadata,
         name: options?.name,
+        description: options?.description,
       }
     );
 
@@ -440,6 +446,10 @@ export class FileSystemAssistants implements AssistantsRepo {
       if (options?.name != null) {
         assistant["name"] = options?.name ?? assistant["name"];
       }
+      if (options?.description != null) {
+        assistant["description"] =
+          options?.description ?? assistant["description"];
+      }
 
       if (metadata != null) {
         assistant["metadata"] = metadata ?? assistant["metadata"];
@@ -463,6 +473,7 @@ export class FileSystemAssistants implements AssistantsRepo {
         config: options?.config ?? assistant["config"],
         context: options?.context ?? assistant["context"],
         name: options?.name ?? assistant["name"],
+        description: options?.description ?? assistant["description"],
         metadata: metadata ?? assistant["metadata"],
         created_at: now,
       };
@@ -636,6 +647,7 @@ export class FileSystemThreads implements ThreadsRepo {
   async *search(
     options: {
       metadata?: Metadata;
+      ids?: string[];
       status?: ThreadStatus;
       values?: Record<string, unknown>;
       limit: number;
@@ -647,6 +659,7 @@ export class FileSystemThreads implements ThreadsRepo {
   ): AsyncGenerator<{ thread: Thread; total: number }> {
     const [filters] = await handleAuthEvent(auth, "threads:search", {
       metadata: options.metadata,
+      ids: options.ids,
       status: options.status,
       values: options.values,
       limit: options.limit,
@@ -656,6 +669,9 @@ export class FileSystemThreads implements ThreadsRepo {
     yield* this.conn.withGenerator(async function* (STORE) {
       const filtered = Object.values(STORE.threads)
         .filter((thread) => {
+          if (options.ids != null && options.ids.length > 0) {
+            if (!options.ids.includes(thread["thread_id"])) return false;
+          }
           if (
             options.metadata != null &&
             !isJsonbContained(thread["metadata"], options.metadata)
@@ -903,7 +919,7 @@ export class FileSystemThreads implements ThreadsRepo {
       thread_id,
     });
 
-    return this.conn.with((STORE) => {
+    const fromThread = await this.conn.with((STORE) => {
       const thread = STORE.threads[thread_id];
       if (!thread)
         throw new HTTPException(409, { message: "Thread not found" });
@@ -911,14 +927,23 @@ export class FileSystemThreads implements ThreadsRepo {
       if (!isAuthMatching(thread["metadata"], filters)) {
         throw new HTTPException(409, { message: "Thread not found" });
       }
+      return thread;
+    });
 
-      const newThreadId = uuid4();
-      const now = new Date();
+    const newThreadId = uuid4();
+    const now = new Date();
+    const newMetadata = { ...fromThread.metadata, thread_id: newThreadId };
+    await handleAuthEvent(auth, "threads:create", {
+      thread_id: newThreadId,
+      metadata: newMetadata,
+    });
+
+    return this.conn.with((STORE) => {
       STORE.threads[newThreadId] = {
         thread_id: newThreadId,
         created_at: now,
         updated_at: now,
-        metadata: { ...thread.metadata, thread_id: newThreadId },
+        metadata: newMetadata,
         config: {},
         status: "idle",
       };

@@ -1,5 +1,51 @@
 # @langchain/langgraph-cli
 
+## 0.0.69
+
+### Patch Changes
+
+- Updated dependencies [f2aa533]
+  - @langchain/langgraph-api@0.0.69
+
+## 0.0.68
+
+### Patch Changes
+
+- 7770c6a: Add `new` command to `@langchain/langgraph-cli` CLI
+- Updated dependencies [7770c6a]
+  - create-langgraph@0.0.4
+  - @langchain/langgraph-api@0.0.68
+
+## 0.0.67
+
+### Patch Changes
+
+- Updated dependencies [e23fa7f]
+  - @langchain/langgraph-api@0.0.67
+
+## 0.0.66
+
+### Patch Changes
+
+- Updated dependencies [5176f1c]
+- Updated dependencies [68a1aa8]
+  - @langchain/langgraph-api@0.0.66
+
+## 0.0.65
+
+### Patch Changes
+
+- Updated dependencies [0aefafe]
+  - @langchain/langgraph-api@0.0.65
+
+## 0.0.64
+
+### Patch Changes
+
+- Updated dependencies [30bcfcd]
+- Updated dependencies [572de43]
+  - @langchain/langgraph-api@0.0.64
+
 ## 0.0.63
 
 ### Patch Changes

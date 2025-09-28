@@ -1,5 +1,54 @@
 # @langchain/langgraph-api
 
+## 0.0.69
+
+### Patch Changes
+
+- f2aa533: Updated typing of auth filters
+  - @langchain/langgraph-ui@0.0.69
+
+## 0.0.68
+
+### Patch Changes
+
+- @langchain/langgraph-ui@0.0.68
+
+## 0.0.67
+
+### Patch Changes
+
+- e23fa7f: Add support for `sort_by`, `sort_order` and `select` when searching for assistants and add support for pagination headers.
+  - @langchain/langgraph-ui@0.0.67
+
+## 0.0.66
+
+### Patch Changes
+
+- 5176f1c: chore(api): add description field for assistants
+- 68a1aa8: fix(api): call threads:create auth handler when copying a thread
+  - @langchain/langgraph-ui@0.0.66
+
+## 0.0.65
+
+### Patch Changes
+
+- 0aefafe: Skip auth middleware when requesting JS/CSS assets for built-in generative UI
+  - @langchain/langgraph-ui@0.0.65
+
+## 0.0.64
+
+### Patch Changes
+
+- 30bcfcd: Assume `http` protocol only when accessing UI components from frontend served from `localhost` or `127.0.0.1` (#1596, #1573)
+- 572de43: feat(threads): add `ids` filter to Threads.search
+
+  - SDK: `ThreadsClient.search` now accepts `ids?: string[]` and forwards it to `/threads/search`.
+  - API: `/threads/search` schema accepts `ids` and storage filters by provided thread IDs.
+
+  This enables fetching a specific set of threads directly via the search endpoint, while remaining backward compatible.
+
+  - @langchain/langgraph-ui@0.0.64
+
 ## 0.0.63
 
 ### Patch Changes
