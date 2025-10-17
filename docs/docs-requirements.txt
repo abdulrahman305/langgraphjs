@@ -6,6 +6,7 @@ mkdocs-minify-plugin
 mkdocs-open-in-new-tab
 mkdocs-rss-plugin
 mkdocs-typedoc
+mkdocs-exclude-search
 markdown-include
 markdown-callouts
 zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
