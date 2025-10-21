@@ -27,7 +27,7 @@
   "author": "LangChain",
   "license": "MIT",
   "dependencies": {
-    "@langchain/langgraph": "workspace:*"
+    "@langchain/langgraph": "0.0.1"
   },
   "peerDependencies": {
     "@langchain/core": "^1.0.1",
