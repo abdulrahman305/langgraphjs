@@ -1,5 +1,18 @@
 # @langchain/langgraph-sdk
 
+## 1.0.2
+
+### Patch Changes
+
+- 1f6efc5: Ensure `isLoading` is set to `false` when cancelling the stream due to thread ID change
+
+## 1.0.1
+
+### Patch Changes
+
+- b9be526: Adding functionality to search assistants by name in the in-memory server implementation.
+- cc9dc28: Add `values` parameter to thread search
+
 ## 1.0.0
 
 ### Major Changes

@@ -28,6 +28,7 @@ import {
   ThreadSortBy,
   ThreadState,
   ThreadStatus,
+  ThreadValuesFilter,
 } from "./schema.js";
 import type {
   Command,
@@ -606,6 +607,7 @@ export class AssistantsClient extends BaseClient {
    */
   async search(query?: {
     graphId?: string;
+    name?: string;
     metadata?: Metadata;
     limit?: number;
     offset?: number;
@@ -617,6 +619,7 @@ export class AssistantsClient extends BaseClient {
       method: "POST",
       json: {
         graph_id: query?.graphId ?? undefined,
+        name: query?.name ?? undefined,
         metadata: query?.metadata ?? undefined,
         limit: query?.limit ?? 10,
         offset: query?.offset ?? 0,
@@ -866,7 +869,15 @@ export class ThreadsClient<
      * Must be one of 'asc' or 'desc'.
      */
     sortOrder?: SortOrder;
+    /**
+     * Array of fields to select.
+     * Elements or array must be one of 'thread_id, 'created_at', 'updated_at', 'metadata', 'config', 'context', 'status', 'values', or 'interrupts'.
+     */
     select?: ThreadSelectField[];
+    /**
+     * Values to filter threads by.
+     */
+    values?: ThreadValuesFilter;
   }): Promise<Thread<ValuesType>[]> {
     return this.fetch<Thread<ValuesType>[]>("/threads/search", {
       method: "POST",
@@ -879,6 +890,7 @@ export class ThreadsClient<
         sort_by: query?.sortBy,
         sort_order: query?.sortOrder,
         select: query?.select ?? undefined,
+        values: query?.values ?? undefined,
       },
     });
   }

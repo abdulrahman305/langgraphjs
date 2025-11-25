@@ -2,7 +2,7 @@ import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 
 import { v4 as uuid } from "uuid";
-import { z } from "zod";
+import { z } from "zod/v3";
 
 import {
   getAssistantId,
@@ -78,6 +78,7 @@ api.post(
     for await (const item of assistants().search(
       {
         graph_id: payload.graph_id,
+        name: payload.name,
         metadata: payload.metadata,
         limit: payload.limit ?? 10,
         offset: payload.offset ?? 0,
